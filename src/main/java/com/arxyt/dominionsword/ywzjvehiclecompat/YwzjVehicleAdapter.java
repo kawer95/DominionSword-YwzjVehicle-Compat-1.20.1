@@ -198,6 +198,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     @Override
+    public float portraitYawDegrees(Entity vehicle) {
+        // Helicopters already face the correct way in the native preview axes.
+        // Ground vehicle model fronts are reversed, so rotate only those by 180°.
+        return isRotaryWingVehicle(vehicle) ? 35.0F : 215.0F;
+    }
+
+    @Override
     public PortraitTransform portraitTransform(Entity vehicle) {
         // YWZJ's own VehicleWeaponSelectScreen uses a negative-Z scale followed by
         // X(180-pitch), Y(180+yaw). Opt into that renderer-native convention so the

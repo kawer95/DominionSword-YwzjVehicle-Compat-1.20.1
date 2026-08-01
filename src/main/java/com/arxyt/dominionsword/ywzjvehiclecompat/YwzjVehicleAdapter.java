@@ -205,6 +205,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     @Override
+    public PortraitRenderScope beginPortraitRender(Entity vehicle) {
+        return MuzzleFlashPortraitScope.suppress(vehicle);
+    }
+
+    @Override
     public PortraitTransform portraitTransform(Entity vehicle) {
         // YWZJ's own VehicleWeaponSelectScreen uses a negative-Z scale followed by
         // X(180-pitch), Y(180+yaw). Opt into that renderer-native convention so the
@@ -2902,6 +2907,49 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             }
         }
         return null;
+    }
+
+    /**
+     * The released YWZJ renderer unconditionally draws every special bone after
+     * the base model, including MUZZLE_FLASH. Temporarily remove only those entries
+     * from the shared display model while Dominion Sword renders an off-screen
+     * portrait, then restore the exact original list and order.
+     */
+    private static final class MuzzleFlashPortraitScope {
+        @SuppressWarnings("unchecked")
+        private static PortraitRenderScope suppress(Entity vehicle) {
+            try {
+                Class<?> assetsType = Class.forName("org.ywzj.vehicle.client.resource.ClientAssetsManager");
+                Object manager = assetsType.getField("INSTANCE").get(null);
+                Object displayOptional = invoke(manager, "getVehicleDisplay", new Class<?>[]{net.minecraft.resources.ResourceLocation.class}, ((AbstractVehicle) vehicle).getDisplayId());
+                Object display = displayOptional instanceof Optional<?> optional ? optional.orElse(null) : displayOptional;
+                Object model = invoke(display, "getModel", new Class<?>[0]);
+                if (model == null) return PortraitRenderScope.NOOP;
+                Object entriesValue = readMember(model, "specialBoneEntries");
+                if (!(entriesValue instanceof List<?>)) entriesValue = readMember(model, "bakedSpecialBoneEntries");
+                if (!(entriesValue instanceof List<?> entries) || entries.isEmpty()) return PortraitRenderScope.NOOP;
+                List<Object> mutable = (List<Object>) entries;
+                List<Object> original = new ArrayList<>(mutable);
+                mutable.removeIf(MuzzleFlashPortraitScope::isMuzzleFlashEntry);
+                if (mutable.size() == original.size()) return PortraitRenderScope.NOOP;
+                return () -> {
+                    try {
+                        mutable.clear();
+                        mutable.addAll(original);
+                    } catch (RuntimeException ignored) {
+                    }
+                };
+            } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+                return PortraitRenderScope.NOOP;
+            }
+        }
+
+        private static boolean isMuzzleFlashEntry(Object entry) {
+            Object effect = readMember(entry, "effect");
+            if (effect == null) effect = invoke(entry, "effect", new Class<?>[0]);
+            Object type = readMember(effect, "type");
+            return type instanceof Enum<?> value && "MUZZLE_FLASH".equals(value.name());
+        }
     }
 
     private record ClassNameKey(Class<?> type, String name) {}

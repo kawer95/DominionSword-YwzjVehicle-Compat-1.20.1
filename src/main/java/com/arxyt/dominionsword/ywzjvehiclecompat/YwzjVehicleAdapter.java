@@ -191,9 +191,15 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     @Override
     public float portraitPitchDegrees(Entity vehicle) {
-        // Positive pitch presents the roof from above. The generic negative pitch
-        // looked up at YWZJ vehicles from beneath because of their model transform.
         return 16.0F;
+    }
+
+    @Override
+    public PortraitTransform portraitTransform(Entity vehicle) {
+        // YWZJ's own VehicleWeaponSelectScreen uses a negative-Z scale followed by
+        // X(180-pitch), Y(180+yaw). Opt into that renderer-native convention so the
+        // portrait camera looks down from above instead of up through the chassis.
+        return PortraitTransform.INVENTORY_XY;
     }
 
     @Override

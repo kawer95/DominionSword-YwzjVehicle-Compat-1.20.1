@@ -190,6 +190,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     @Override
+    public float portraitPitchDegrees(Entity vehicle) {
+        // Positive pitch presents the roof from above. The generic negative pitch
+        // looked up at YWZJ vehicles from beneath because of their model transform.
+        return 16.0F;
+    }
+
+    @Override
     public AABB selectionBounds(Entity vehicle) {
         AABB fromObb = allComponentObbAabb(vehicle);
         AABB base = fromObb == null ? vehicle.getBoundingBox() : union(fromObb, vehicle.getBoundingBox());
@@ -202,6 +209,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return projected;
         }
         return base.inflate(0.75D, 0.25D, 0.75D);
+    }
+
+    @Override
+    public AABB portraitBounds(Entity vehicle) {
+        AABB components = allComponentObbAabb(vehicle);
+        return components == null ? vehicle.getBoundingBox() : union(components, vehicle.getBoundingBox());
+    }
+
+    @Override
+    public float portraitScaleMultiplier(Entity vehicle) {
+        // Component OBB unions are deliberately conservative (rotors, barrels and
+        // attachments). Recover the otherwise visible empty ring after exact 2-D fit.
+        return 1.10F;
     }
 
     @Override

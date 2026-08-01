@@ -191,7 +191,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     @Override
     public float portraitPitchDegrees(Entity vehicle) {
-        return 16.0F;
+        // Rotary-wing models follow the native preview convention as-is. Ground
+        // vehicle model roots use the opposite vertical axis and require the
+        // inverse presentation pitch to expose the roof rather than the belly.
+        return isRotaryWingVehicle(vehicle) ? 16.0F : -16.0F;
     }
 
     @Override

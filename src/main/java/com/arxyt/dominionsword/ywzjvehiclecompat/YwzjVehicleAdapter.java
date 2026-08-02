@@ -2930,13 +2930,30 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 if (!(entriesValue instanceof List<?> entries) || entries.isEmpty()) return PortraitRenderScope.NOOP;
                 List<Object> mutable = (List<Object>) entries;
                 List<Object> original = new ArrayList<>(mutable);
-                mutable.removeIf(MuzzleFlashPortraitScope::isMuzzleFlashEntry);
-                if (mutable.size() == original.size()) return PortraitRenderScope.NOOP;
+                List<BoneVisibility> hiddenBones = new ArrayList<>();
+                for (Object entry : original) {
+                    if (isMuzzleFlashEntry(entry)) {
+                        BoneVisibility visibility = hideMuzzleBone(model, entry);
+                        if (visibility != null) hiddenBones.add(visibility);
+                    }
+                }
+                try {
+                    mutable.removeIf(MuzzleFlashPortraitScope::isMuzzleFlashEntry);
+                } catch (RuntimeException exception) {
+                    restoreBoneVisibility(hiddenBones);
+                    return PortraitRenderScope.NOOP;
+                }
+                if (mutable.size() == original.size()) {
+                    restoreBoneVisibility(hiddenBones);
+                    return PortraitRenderScope.NOOP;
+                }
                 return () -> {
                     try {
                         mutable.clear();
                         mutable.addAll(original);
                     } catch (RuntimeException ignored) {
+                    } finally {
+                        restoreBoneVisibility(hiddenBones);
                     }
                 };
             } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
@@ -2949,6 +2966,39 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             if (effect == null) effect = invoke(entry, "effect", new Class<?>[0]);
             Object type = readMember(effect, "type");
             return type instanceof Enum<?> value && "MUZZLE_FLASH".equals(value.name());
+        }
+
+        private static BoneVisibility hideMuzzleBone(Object model, Object entry) {
+            try {
+                // Released 0.5.6 stores the BedrockBone directly on the entry.
+                Object bone = readMember(entry, "bone");
+                // Newer source revisions store an index into the baked instance.
+                if (bone == null) {
+                    Object index = invoke(entry, "boneIndex", new Class<?>[0]);
+                    Object instance = invoke(model, "getDefaultModelInstance", new Class<?>[0]);
+                    if (index instanceof Number number && instance != null)
+                        bone = invoke(instance, "getBone", new Class<?>[]{int.class}, number.intValue());
+                }
+                if (bone == null) return null;
+                Field visible = findField(bone.getClass(), "visible");
+                if (visible == null || visible.getType() != boolean.class) return null;
+                boolean previous = visible.getBoolean(bone);
+                visible.setBoolean(bone, false);
+                return new BoneVisibility(bone, visible, previous);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                return null;
+            }
+        }
+
+        private static void restoreBoneVisibility(List<BoneVisibility> hiddenBones) {
+            for (BoneVisibility visibility : hiddenBones) visibility.restore();
+        }
+
+        private record BoneVisibility(Object bone, Field visible, boolean previous) {
+            private void restore() {
+                try { visible.setBoolean(bone, previous); }
+                catch (ReflectiveOperationException | RuntimeException ignored) {}
+            }
         }
     }
 

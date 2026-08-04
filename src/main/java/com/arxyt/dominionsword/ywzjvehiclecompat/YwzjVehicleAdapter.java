@@ -192,7 +192,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     @Override
     public boolean selectable(Entity vehicle) {
-        return supports(vehicle) && (isRotaryWingVehicle(vehicle) || hasAnyPassenger(vehicle));
+        // Empty vehicles may still be targeted for boarding and rotary-wing craft
+        // keep their dashed projected ring, but direct control requires a passenger.
+        return supports(vehicle) && hasAnyPassenger(vehicle);
     }
 
     @Override
@@ -229,7 +231,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         AABB base = fromObb == null ? vehicle.getBoundingBox() : union(fromObb, vehicle.getBoundingBox());
         if (isRotaryWingVehicle(vehicle)) {
             base = base.inflate(1.0D, 0.0D, 1.0D);
-            double groundY = groundProjectionY(vehicle, base.getCenter().x, base.getCenter().z);
+            double groundY = projectedFootprintGroundY(vehicle, base);
             AABB projected = new AABB(base.minX - 0.75D, groundY + 0.02D, base.minZ - 0.75D,
                     base.maxX + 0.75D, groundY + 0.18D, base.maxZ + 0.75D);
             traceHelicopterSelection(vehicle, projected, groundY);
@@ -2568,6 +2570,28 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             y--;
         }
         return level.getMinBuildHeight();
+    }
+
+    /**
+     * Keep a large projected rotor ring above uneven terrain. A center-only sample
+     * can land in a shallow hole and bury the whole marker even when the remaining
+     * footprint is on the surrounding floor.
+     */
+    private static double projectedFootprintGroundY(Entity vehicle, AABB footprint) {
+        double centerX = footprint.getCenter().x;
+        double centerZ = footprint.getCenter().z;
+        double insetX = Math.min(2.0D, footprint.getXsize() * 0.2D);
+        double insetZ = Math.min(2.0D, footprint.getZsize() * 0.2D);
+        double minX = Math.min(centerX, footprint.minX + insetX);
+        double maxX = Math.max(centerX, footprint.maxX - insetX);
+        double minZ = Math.min(centerZ, footprint.minZ + insetZ);
+        double maxZ = Math.max(centerZ, footprint.maxZ - insetZ);
+        double highest = groundProjectionY(vehicle, centerX, centerZ);
+        highest = Math.max(highest, groundProjectionY(vehicle, minX, centerZ));
+        highest = Math.max(highest, groundProjectionY(vehicle, maxX, centerZ));
+        highest = Math.max(highest, groundProjectionY(vehicle, centerX, minZ));
+        highest = Math.max(highest, groundProjectionY(vehicle, centerX, maxZ));
+        return highest;
     }
 
     private static boolean hasAnyPassenger(Entity vehicle) {

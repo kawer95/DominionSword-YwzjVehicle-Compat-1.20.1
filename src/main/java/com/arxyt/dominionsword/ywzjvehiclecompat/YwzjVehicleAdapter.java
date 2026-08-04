@@ -5,11 +5,13 @@ import com.arxyt.dominionsword.api.DominionVehicleAdapter;
 import com.arxyt.dominionsword.api.DominionAsyncGridPlanner;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -20,6 +22,8 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -76,6 +80,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String HELI_LAST_WEAPON_TRACE_TICK = "DominionSwordYwzjHeliLastWeaponTraceTick";
     private static final String HELI_BRAKE_LATCH = "DominionSwordYwzjHeliBrakeLatch";
     private static final String HELI_COMBAT_TARGET = "DominionSwordYwzjHeliCombatTarget";
+    /** Active persistent flight tasks only; never retain loaded Entity instances. */
+    private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_HELICOPTERS = new ConcurrentHashMap<>();
     private static final double HELI_CLOSE_TRANSLATE_RANGE = 30.0D;
     private static final double HELI_MAX_HORIZONTAL_SPEED = 0.72D;
     private static final double HELI_POSITION_TO_SPEED_GAIN = 0.055D;
@@ -638,16 +644,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     /** Runs persistent helicopter tasks after selection is released. */
     public void tickHelicopterAutopilot(net.minecraft.server.MinecraftServer server) {
         if (server == null) return;
-        for (ServerLevel level : server.getAllLevels()) {
-            for (Entity vehicle : level.getAllEntities()) {
-                if (!isRotaryWingVehicle(vehicle)) continue;
+        ACTIVE_HELICOPTERS.entrySet().removeIf(entry -> {
+            ServerLevel level = server.getLevel(entry.getKey());
+            if (level == null) return true;
+            entry.getValue().removeIf(id -> {
+                Entity vehicle = level.getEntity(id);
+                if (vehicle == null || !vehicle.isAlive() || !isRotaryWingVehicle(vehicle)) return true;
                 LivingEntity pilot = driver(vehicle);
                 if (!(pilot instanceof Mob mob)) {
                     if (isHelicopterFlying(vehicle)) stopHelicopter(vehicle);
-                    continue;
+                    return true;
                 }
                 String mode = mob.getPersistentData().getString(HELI_MODE);
-                if (mode.isBlank() || "LANDED".equals(mode)) continue;
+                if (mode.isBlank() || "LANDED".equals(mode)) return true;
                 Vec3 facingTarget = null;
                 if (mob.getPersistentData().hasUUID(HELI_COMBAT_TARGET)) {
                     Entity combatTarget = level.getEntity(mob.getPersistentData().getUUID(HELI_COMBAT_TARGET));
@@ -655,8 +664,22 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     else mob.getPersistentData().remove(HELI_COMBAT_TARGET);
                 }
                 moveHelicopter(vehicle, helicopterTaskTarget(mob, vehicle), facingTarget);
-            }
-        }
+                return false;
+            });
+            return entry.getValue().isEmpty();
+        });
+    }
+
+    public void onEntityLoaded(Entity entity) {
+        Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
+        if (vehicle == null || !isRotaryWingVehicle(vehicle) || !(driver(vehicle) instanceof Mob pilot)) return;
+        String mode = pilot.getPersistentData().getString(HELI_MODE);
+        if (!mode.isBlank() && !"LANDED".equals(mode)) registerActiveHelicopter(vehicle);
+    }
+
+    public void onEntityUnloaded(Entity entity) {
+        Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
+        if (vehicle != null) unregisterActiveHelicopter(vehicle);
     }
 
     private static boolean moveHelicopter(Entity vehicle, Vec3 target) {
@@ -670,6 +693,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return false;
         }
         CompoundTag task = mob.getPersistentData();
+        registerActiveHelicopter(vehicle);
         String mode = task.getString(HELI_MODE);
         if (mode.isBlank() || "LANDED".equals(mode)) {
             /*
@@ -958,6 +982,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         task.remove(HELI_LOCKED_ALTITUDE);
         task.remove(HELI_BRAKE_LATCH);
         task.remove(HELI_COMBAT_TARGET);
+        unregisterActiveHelicopter(vehicle);
     }
 
     private static double setCalculatedCollective(RotaryWingVehicle helicopter, double altitudeError,
@@ -992,6 +1017,22 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         task.putDouble(HELI_NAV_X, vehicle.getX());
         task.putDouble(HELI_NAV_Y, vehicle.getY());
         task.putDouble(HELI_NAV_Z, vehicle.getZ());
+        if (mode.isBlank() || "LANDED".equals(mode)) unregisterActiveHelicopter(vehicle);
+        else registerActiveHelicopter(vehicle);
+    }
+
+    private static void registerActiveHelicopter(Entity vehicle) {
+        if (vehicle == null || vehicle.level().isClientSide()) return;
+        ACTIVE_HELICOPTERS.computeIfAbsent(vehicle.level().dimension(), ignored -> ConcurrentHashMap.newKeySet()).add(vehicle.getUUID());
+    }
+
+    private static void unregisterActiveHelicopter(Entity vehicle) {
+        if (vehicle == null) return;
+        Set<UUID> entries = ACTIVE_HELICOPTERS.get(vehicle.level().dimension());
+        if (entries != null) {
+            entries.remove(vehicle.getUUID());
+            if (entries.isEmpty()) ACTIVE_HELICOPTERS.remove(vehicle.level().dimension(), entries);
+        }
     }
 
     private static Vec3 helicopterTaskTarget(Mob mob, Entity vehicle) {
@@ -2503,14 +2544,28 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static double groundProjectionY(Entity vehicle, double x, double z) {
         if (vehicle == null || vehicle.level() == null) return 0.0D;
         Level level = vehicle.level();
+        int blockX = Mth.floor(x), blockZ = Mth.floor(z);
+        // Client heightmaps can temporarily report min build height and cannot
+        // distinguish a roof/sky island above the aircraft from ground below it.
+        // Project from the aircraft downward and skip whole empty sections, so the
+        // always-visible command ring remains correct in every 3D environment.
         BlockPos.MutableBlockPos cursor = BlockPos.containing(x, vehicle.getY(), z).mutable();
-        for (int y = cursor.getY(); y >= level.getMinBuildHeight(); y--) {
+        LevelChunk chunk = level.getChunk(blockX >> 4, blockZ >> 4);
+        LevelChunkSection[] sections = chunk.getSections();
+        int y = Math.min(cursor.getY(), level.getMaxBuildHeight() - 1);
+        while (y >= level.getMinBuildHeight()) {
+            int sectionIndex = chunk.getSectionIndex(y);
+            if (sectionIndex >= 0 && sectionIndex < sections.length && sections[sectionIndex].hasOnlyAir()) {
+                y = SectionPos.sectionToBlockCoord(SectionPos.blockToSectionCoord(y)) - 1;
+                continue;
+            }
             cursor.setY(y);
             BlockState state = level.getBlockState(cursor);
             VoxelShape shape = state.getCollisionShape(level, cursor);
             if (!state.is(Blocks.BARRIER) && !shape.isEmpty()) {
                 return y + shape.max(net.minecraft.core.Direction.Axis.Y);
             }
+            y--;
         }
         return level.getMinBuildHeight();
     }

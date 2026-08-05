@@ -9,6 +9,12 @@ displayName="${mod_name}"
 authors="${mod_authors}"
 description='''${mod_description}'''
 
+[modproperties.${mod_id}]
+dominionsword_addon=true
+dominionsword_addon_name_zh_cn="\\u7edf\\u5fa1\\u4e4b\\u5251\\uff1a\\u6c38\\u65e0\\u6b62\\u5883\\u517c\\u5bb9"
+dominionsword_addon_name_en_us="Dominion Sword: YWZJ Vehicle Compatibility"
+dominionsword_addon_name_ja_jp="\\u30c9\\u30df\\u30cb\\u30aa\\u30f3\\u30bd\\u30fc\\u30c9\\uff1aYWZJ Vehicle\\u4e92\\u63db"
+
 [[dependencies.${mod_id}]]
 modId="forge"
 mandatory=true

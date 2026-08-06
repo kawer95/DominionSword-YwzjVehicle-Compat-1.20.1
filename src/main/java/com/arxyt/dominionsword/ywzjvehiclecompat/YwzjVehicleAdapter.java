@@ -112,6 +112,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final double CLOSE_REVERSE_RADIUS = 25.0D;
     private static final double TURN_IN_PLACE_ANGLE = 55.0D;
     private static final double REVERSE_ANGLE = 150.0D;
+    private static final double SIDE_REVERSE_ANGLE = 100.0D;
     private static final double ATTACK_RANGE = 96.0D;
     private static final double STANDOFF_RANGE = 48.0D;
     private static final double MIN_FIRE_RANGE = 6.0D;
@@ -145,11 +146,14 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String THREE_POINT_LAST_Z = "DominionSwordYwzjThreePointLastZ";
     private static final String THREE_POINT_LAST_ABS_YAW = "DominionSwordYwzjThreePointLastAbsYaw";
     private static final String THREE_POINT_STUCK_TICKS = "DominionSwordYwzjThreePointStuckTicks";
+    private static final String THREE_POINT_GIVE_UP_UNTIL = "DominionSwordYwzjThreePointGiveUpUntil";
     private static final int MAX_THREE_POINT_TICKS = 170;
     private static final int THREE_POINT_REVERSE_PHASE = 0;
     private static final int THREE_POINT_FORWARD_PHASE = 1;
     private static final int THREE_POINT_PHASE_STUCK_TICKS = 10;
     private static final int THREE_POINT_FORWARD_PHASE_TICKS = 18;
+    private static final int THREE_POINT_GIVE_UP_STUCK_TICKS = 20;
+    private static final long THREE_POINT_GIVE_UP_COOLDOWN_TICKS = 40L;
     private static final String THREE_POINT_TARGET_X = "DominionSwordYwzjThreePointTargetX";
     private static final String THREE_POINT_TARGET_Z = "DominionSwordYwzjThreePointTargetZ";
     private static final String CAPTURED_TARGET_X = "DominionSwordYwzjCapturedTargetX";
@@ -555,20 +559,27 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 backward = pulse && signed >= -0.15D;
             }
 
+            boolean reverseSteer = false;
             if (!forward && !backward && !brake && absYaw >= TURN_IN_PLACE_ANGLE) {
-                // Tracked vehicles rotate in place; wheeled vehicles need a small crawl to make steering meaningful.
-                forward = !isTrackedVehicle(vehicle);
+                // Tracked vehicles rotate in place; wheeled vehicles with a large turn radius back toward
+                // the target instead of a forward crawl (which barely turns them at large turn radii).
+                if (!isTrackedVehicle(vehicle)) {
+                    backward = true;
+                    reverseSteer = true;
+                }
             }
 
+            boolean steerRight = turn && (reverseSteer ? yawDiff < 0.0F : yawDiff > 0.0F);
+            boolean steerLeft = turn && (reverseSteer ? yawDiff > 0.0F : yawDiff < 0.0F);
             double turnRadius = estimatedTurnRadius(vehicle, shape);
             boolean activeThreePoint = vehicle.getPersistentData().contains(THREE_POINT_STEP);
             boolean cannotArc = cannotArcToTarget(vehicle, absYaw, distance, shape);
             pathDebug(vehicle, "DECISION", "mode=%s final=%s activeThreePoint=%s target=%s safe=%s yawDiff=%.1f absYaw=%.1f dist=%.2f speed=%.3f turnRadius=%.2f shortReverse=%s cannotArc=%s brake=%s forward=%s backward=%s turn=%s keys=%d",
                     driveDecision.mode(), finalTarget, activeThreePoint, fmt(driveTarget), fmt(safeTarget), yawDiff, absYaw, distance, speed, turnRadius,
                     isShortReverseTarget(absYaw, distance, shape), cannotArc, brake, forward, backward, turn,
-                    (int) packControl(forward, backward, yawDiff > 0.0F && turn, yawDiff < 0.0F && turn, brake));
+                    (int) packControl(forward, backward, steerRight, steerLeft, brake));
             LagTrace.mark("drive_decision");
-            applyControl(vehicle, forward, backward, yawDiff > 0.0F && turn, yawDiff < 0.0F && turn, brake);
+            applyControl(vehicle, forward, backward, steerRight, steerLeft, brake);
             LagTrace.mark("apply_control");
             rememberFutureFootprint(vehicle, driveTarget, shape);
             return true;
@@ -2276,7 +2287,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         boolean rearTarget = absYaw >= REVERSE_ANGLE;
         boolean tracked = isTrackedVehicle(vehicle);
         boolean shortReverseTarget = isShortReverseTarget(absYaw, distance, shape);
-        boolean cannotArc = !tracked && !shortReverseTarget && cannotArcToTarget(vehicle, absYaw, distance, shape);
+        boolean threePointCooldown = vehicle.level().getGameTime() < vehicle.getPersistentData().getLong(THREE_POINT_GIVE_UP_UNTIL);
+        boolean cannotArc = !tracked && !shortReverseTarget && !threePointCooldown && cannotArcToTarget(vehicle, absYaw, distance, shape);
         double turnPenalty = absYaw / 8.0D;
         double stopPenalty = Math.max(0.0D, speed) * 18.0D;
         double forwardEta = distance / 0.10D + turnPenalty + stopPenalty;
@@ -2304,7 +2316,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static boolean isShortReverseTarget(double absYaw, double distance, VehicleShape shape) {
         double reverseRange = Math.max(25.0D, shape.radius() * 4.0D);
-        return distance <= reverseRange && absYaw >= REVERSE_ANGLE;
+        return distance <= reverseRange && absYaw >= SIDE_REVERSE_ANGLE;
     }
 
     private static boolean cannotArcToTarget(Entity vehicle, double absYaw, double distance, VehicleShape shape) {
@@ -2370,6 +2382,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return Short.MIN_VALUE;
         }
         updateThreePointProgress(vehicle, data, absYaw);
+        if (data.getInt(THREE_POINT_STUCK_TICKS) >= THREE_POINT_GIVE_UP_STUCK_TICKS) {
+            data.putLong(THREE_POINT_GIVE_UP_UNTIL, vehicle.level().getGameTime() + THREE_POINT_GIVE_UP_COOLDOWN_TICKS);
+            clearThreePointState(vehicle);
+            return Short.MIN_VALUE;
+        }
         int phase = data.getInt(THREE_POINT_STEP);
         ticks = data.getInt(THREE_POINT_TICKS);
         if (YwzjVehicleCompatConfig.multiStageKTurnEnabled() && phase == THREE_POINT_FORWARD_PHASE && data.getInt(THREE_POINT_STUCK_TICKS) == 0 && ticks > THREE_POINT_FORWARD_PHASE_TICKS) {

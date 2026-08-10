@@ -260,7 +260,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     @Override
     public List<Vec3> selectionCorners(Entity vehicle) {
         if (isRotaryWingVehicle(vehicle)) return DominionVehicleAdapter.super.selectionCorners(vehicle);
-        List<Vec3> corners = mainObbTopCorners(vehicle, 1.0D);
+        List<Vec3> corners = completeObbTopCorners(vehicle, 1.0D);
         if (!corners.isEmpty()) return corners;
         return DominionVehicleAdapter.super.selectionCorners(vehicle);
     }
@@ -2855,6 +2855,62 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         double cz = top.stream().mapToDouble(p -> p.z).average().orElse(vehicle.getZ());
         top.sort(Comparator.comparingDouble(p -> Math.atan2(p.z - cz, p.x - cx)));
         return top.stream().map(p -> p.add(0.0D, yOffset, 0.0D)).toList();
+    }
+
+    /** Builds one rotated footprint around every component OBB instead of only the main chassis cube. */
+    private static List<Vec3> completeObbTopCorners(Entity vehicle, double yOffset) {
+        List<Vec3> main = mainObbTopCorners(vehicle, 0.0D);
+        if (main.size() < 4) return List.of();
+        Vec3 axisX = main.get(1).subtract(main.get(0)).multiply(1.0D, 0.0D, 1.0D);
+        Vec3 second = main.get(3).subtract(main.get(0)).multiply(1.0D, 0.0D, 1.0D);
+        if (axisX.lengthSqr() < 1.0E-8D || second.lengthSqr() < 1.0E-8D) return List.of();
+        axisX = axisX.normalize();
+        Vec3 axisZ = second.subtract(axisX.scale(second.dot(axisX)));
+        if (axisZ.lengthSqr() < 1.0E-8D) axisZ = new Vec3(-axisX.z, 0.0D, axisX.x);
+        else axisZ = axisZ.normalize();
+
+        List<Vec3> points = new ArrayList<>();
+        if (vehicle instanceof AbstractVehicle ywzjVehicle && ywzjVehicle.getVehicleCubeOBBs() != null) {
+            for (Object cube : ywzjVehicle.getVehicleCubeOBBs()) appendObbVertices(points, cube == null ? null : invokeNoArg(cube, "obb"));
+        }
+        Object mainCube = invokeNoArg(vehicle, "getMainCubeOBB");
+        appendObbVertices(points, mainCube == null ? null : invokeNoArg(mainCube, "obb"));
+        AABB entityBounds = vehicle.getBoundingBox();
+        points.addAll(List.of(
+                new Vec3(entityBounds.minX, entityBounds.minY, entityBounds.minZ), new Vec3(entityBounds.maxX, entityBounds.minY, entityBounds.minZ),
+                new Vec3(entityBounds.maxX, entityBounds.minY, entityBounds.maxZ), new Vec3(entityBounds.minX, entityBounds.minY, entityBounds.maxZ),
+                new Vec3(entityBounds.minX, entityBounds.maxY, entityBounds.minZ), new Vec3(entityBounds.maxX, entityBounds.maxY, entityBounds.minZ),
+                new Vec3(entityBounds.maxX, entityBounds.maxY, entityBounds.maxZ), new Vec3(entityBounds.minX, entityBounds.maxY, entityBounds.maxZ)));
+        if (points.isEmpty()) return List.of();
+
+        double minX = Double.POSITIVE_INFINITY, minZ = Double.POSITIVE_INFINITY, maxX = Double.NEGATIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
+        double topY = Double.NEGATIVE_INFINITY;
+        for (Vec3 point : points) {
+            double x = point.dot(axisX), z = point.dot(axisZ);
+            minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+            minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+            topY = Math.max(topY, point.y);
+        }
+        if (!Double.isFinite(minX) || !Double.isFinite(topY)) return List.of();
+        double y = topY + yOffset;
+        Vec3 minMin = axisX.scale(minX).add(axisZ.scale(minZ));
+        Vec3 maxMin = axisX.scale(maxX).add(axisZ.scale(minZ));
+        Vec3 maxMax = axisX.scale(maxX).add(axisZ.scale(maxZ));
+        Vec3 minMax = axisX.scale(minX).add(axisZ.scale(maxZ));
+        return List.of(
+                new Vec3(minMin.x, y, minMin.z), new Vec3(maxMin.x, y, maxMin.z),
+                new Vec3(maxMax.x, y, maxMax.z), new Vec3(minMax.x, y, minMax.z));
+    }
+
+    private static void appendObbVertices(List<Vec3> output, Object obb) {
+        Object vertices = obb == null ? null : invokeNoArg(obb, "getVertices");
+        if (!(vertices instanceof Object[] array)) return;
+        for (Object vertex : array) {
+            double x = readDouble(readMember(vertex, "x"), Double.NaN);
+            double y = readDouble(readMember(vertex, "y"), Double.NaN);
+            double z = readDouble(readMember(vertex, "z"), Double.NaN);
+            if (Double.isFinite(x) && Double.isFinite(y) && Double.isFinite(z)) output.add(new Vec3(x, y, z));
+        }
     }
 
     private record SafeCandidate(Vec3 position, double score) {}

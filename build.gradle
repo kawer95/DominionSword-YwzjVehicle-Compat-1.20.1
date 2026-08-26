@@ -28,12 +28,17 @@ repositories { mavenCentral() }
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 
     // This addon is meaningless without Dominion Sword and YWZJ Vehicle. Neither is bundled.
     if (!project.hasProperty('dominionsword_jar')) throw new GradleException('Missing -Pdominionsword_jar')
     if (!project.hasProperty('ywzj_vehicle_jar')) throw new GradleException('Missing -Pywzj_vehicle_jar')
     compileOnly files(project.property('dominionsword_jar'))
     compileOnly files(project.property('ywzj_vehicle_jar'))
+    testImplementation files(project.property('dominionsword_jar'))
+    testImplementation files(project.property('ywzj_vehicle_jar'))
 }
 
 tasks.named('processResources', ProcessResources).configure {
@@ -49,3 +54,30 @@ tasks.named('processResources', ProcessResources).configure {
 
 tasks.named('jar', Jar).configure { finalizedBy 'reobfJar' }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.withType(Test).configureEach { useJUnitPlatform() }
+
+// Java 17 on Windows reads Gradle worker argument files with the active ANSI
+// code page.  This checkout path is non-ASCII, so keep the worker classpath
+// ASCII and carry the real paths through a URI-encoded manifest instead.
+def testClasspathJar = tasks.register('testClasspathJar', Jar) {
+    archiveFileName = 'dominionsword-ywzj-compat-test-classpath.jar'
+    def checkoutKey = Integer.toHexString(project.projectDir.absolutePath.hashCode())
+    destinationDirectory = file("${gradle.gradleUserHomeDir}/caches/dominionsword/test-classpath/${checkoutKey}")
+    def encodedTestClasspath = providers.provider {
+        sourceSets.test.runtimeClasspath.files.collect { entry ->
+            String uri = entry.toURI().toASCIIString()
+            String name = entry.name.toLowerCase(java.util.Locale.ROOT)
+            return name.endsWith('.jar') || name.endsWith('.zip') || uri.endsWith('/') ? uri : "${uri}/"
+        }.join(' ')
+    }
+    inputs.property('encodedTestClasspath', encodedTestClasspath)
+    doFirst { manifest.attributes('Class-Path': encodedTestClasspath.get()) }
+}
+
+tasks.withType(Test).configureEach {
+    if (System.getProperty('os.name', '').toLowerCase(java.util.Locale.ROOT).contains('windows')
+            && project.projectDir.absolutePath.codePoints().anyMatch { it > 127 }) {
+        dependsOn testClasspathJar
+        classpath = files(testClasspathJar.flatMap { it.archiveFile })
+    }
+}

@@ -162,7 +162,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final long EFFECTIVE_ARRIVAL_TIMEOUT_TICKS = 10L;
     private static final double TARGET_SOFT_CHANGE_DISTANCE = 4.0D;
     private static final long RESERVATION_TTL_TICKS = 5L;
-    private static final double MAX_TRAVEL_STEP_HEIGHT = 0.85D;
+    /** Largest ground-height change accepted for each one-block collision sample. */
+    private static final double MAX_TRAVEL_STEP_HEIGHT = 1.05D;
     private static final double FLEET_TRACK_ROAD_ACCESS_BASE = 18.0D;
     private static final double FLEET_TRACK_ROAD_LOOKAHEAD_BASE = 18.0D;
     private static final long FLEET_TRACK_MAX_AGE_TICKS = 140L;
@@ -1483,7 +1484,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             if (build.cursor < build.points.size()) return;
             DominionAsyncGridPlanner.Point startPoint = new DominionAsyncGridPlanner.Point(0, 0);
             DominionAsyncGridPlanner.Point goalPoint = new DominionAsyncGridPlanner.Point(build.goalX, build.goalZ);
-            build.future = DominionAsyncGridPlanner.submit(new DominionAsyncGridPlanner.Snapshot(startPoint, goalPoint, Map.copyOf(build.cells), PATH_MAX_ITERATIONS, MAX_TRAVEL_STEP_HEIGHT, 2.0D));
+            build.future = DominionAsyncGridPlanner.submit(new DominionAsyncGridPlanner.Snapshot(startPoint, goalPoint, Map.copyOf(build.cells), PATH_MAX_ITERATIONS, terrainGridStepHeight(), 2.0D));
             return;
         }
         if (!build.future.isDone()) return;
@@ -1589,6 +1590,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         Map<AvoidNode, Double> cost = new HashMap<>();
         Map<AvoidNode, AvoidNode> parent = new HashMap<>();
         Set<AvoidNode> closed = new HashSet<>();
+        Map<AvoidNode, Vec3> occupancies = new HashMap<>();
+        occupancies.put(startNode, startPos);
         open.add(new PathState(startNode, 0.0D, bestH));
         cost.put(startNode, 0.0D);
         int iterations = 0;
@@ -1606,14 +1609,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 best = current;
                 break;
             }
+            Vec3 currentOccupy = cachedOccupiableNear(vehicle, currentWorld, current, shape, ignoredVehicles, occupancies);
+            if (currentOccupy == null) continue;
             for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
                 if (dx == 0 && dz == 0) continue;
                 AvoidNode next = new AvoidNode(current.x() + dx, current.z() + dz);
                 if (closed.contains(next)) continue;
                 Vec3 world = worldPos(startPos, next);
                 if (flatDistance(startPos, world) > PATH_SEARCH_RADIUS) continue;
-                Vec3 occupy = occupiableNear(vehicle, world, shape, ignoredVehicles);
-                if (occupy == null || !canSweep(vehicle, currentWorld, occupy, shape, ignoredVehicles)) continue;
+                Vec3 occupy = cachedOccupiableNear(vehicle, world, next, shape, ignoredVehicles, occupancies);
+                if (occupy == null || !canSweep(vehicle, currentOccupy, occupy, shape, ignoredVehicles)) continue;
                 double step = (dx != 0 && dz != 0 ? PATH_STEP * 1.414D : PATH_STEP);
                 double penalty = terrainPenalty(vehicle, occupy) + otherVehiclePenalty(vehicle, occupy, shape, ignoredVehicles) + reservationPenalty(vehicle, occupy, shape);
                 double nextCost = cost.getOrDefault(current, Double.POSITIVE_INFINITY) + step + penalty;
@@ -1634,7 +1639,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         Collections.reverse(nodes);
         List<Vec3> route = new ArrayList<>();
         for (AvoidNode node : nodes) {
-            Vec3 occupy = occupiableNear(vehicle, worldPos(startPos, node), shape, ignoredVehicles);
+            Vec3 occupy = cachedOccupiableNear(vehicle, worldPos(startPos, node), node, shape, ignoredVehicles, occupancies);
             if (occupy != null) route.add(occupy);
         }
         if (route.isEmpty()) route.add(startPos);
@@ -1672,7 +1677,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         Vec3 previous = occupiableNear(vehicle, from, shape, Set.of(vehicle.getUUID()));
         if (previous == null) previous = from;
         for (double d = 0.0D; d <= checked + 0.01D; d += 1.0D) {
-            Vec3 sample = from.add(dir.scale(Math.min(d, checked)));
+            Vec3 sample = terrainProbe(from.add(dir.scale(Math.min(d, checked))), previous.y);
             Vec3 occupy = occupiableForTravel(vehicle, sample, shape, Set.of(vehicle.getUUID()), previous.y);
             if (occupy == null) return false;
             previous = occupy;
@@ -1687,7 +1692,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         Vec3 previous = occupiableNear(vehicle, from, shape, ignoredVehicles);
         if (previous == null) previous = from;
         for (double d = 1.0D; d <= distance + 0.01D; d += 1.0D) {
-            Vec3 sample = from.add(dir.scale(Math.min(d, distance)));
+            Vec3 sample = terrainProbe(from.add(dir.scale(Math.min(d, distance))), previous.y);
             Vec3 occupy = occupiableForTravel(vehicle, sample, shape, ignoredVehicles, previous.y);
             if (occupy == null) return false;
             previous = occupy;
@@ -1727,15 +1732,32 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static Vec3 occupiableForTravel(Entity vehicle, Vec3 around, VehicleShape shape, Set<UUID> ignoredVehicles, double referenceY) {
-        Vec3 occupy = occupiableNear(vehicle, around, shape, ignoredVehicles);
+        Vec3 occupy = occupiableNear(vehicle, terrainProbe(around, referenceY), shape, ignoredVehicles);
         if (occupy == null) return null;
-        if (occupy.y - referenceY > MAX_TRAVEL_STEP_HEIGHT) return null;
+        if (!terrainStepAllowed(referenceY, occupy.y)) return null;
         return occupy;
     }
 
     private static Vec3 occupiableNear(Entity vehicle, Vec3 around, VehicleShape shape, Set<UUID> ignoredVehicles) {
         if (!(vehicle.level() instanceof ServerLevel level)) return around;
+        Vec3 local = occupiableNearHeight(vehicle, around, shape, ignoredVehicles, around.y);
+        if (local != null) return local;
+
+        // The route grid has X/Z nodes only.  Reconstructing a node from its origin
+        // must not make a long downhill disappear after the local probe window is
+        // exhausted.  This is only a terrain candidate; every edge is still swept
+        // through the real collision space before it becomes a route segment.
+        double terrainY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                Mth.floor(around.x), Mth.floor(around.z));
+        return Math.abs(terrainY - around.y) < 1.0E-6D
+                ? null
+                : occupiableNearHeight(vehicle, around, shape, ignoredVehicles, terrainY);
+    }
+
+    private static Vec3 occupiableNearHeight(Entity vehicle, Vec3 around, VehicleShape shape, Set<UUID> ignoredVehicles, double baseY) {
+        if (!(vehicle.level() instanceof ServerLevel level)) return null;
         BlockPos base = BlockPos.containing(around.x, around.y, around.z);
+        if (base.getY() != Mth.floor(baseY)) base = BlockPos.containing(around.x, baseY, around.z);
         for (int dy = 2; dy >= -4; dy--) {
             BlockPos floor = base.offset(0, dy - 1, 0);
             if (level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) continue;
@@ -1743,6 +1765,30 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             if (canOccupy(vehicle, candidate, shape, ignoredVehicles)) return candidate;
         }
         return null;
+    }
+
+    private static Vec3 cachedOccupiableNear(Entity vehicle, Vec3 around, AvoidNode node, VehicleShape shape,
+                                               Set<UUID> ignoredVehicles, Map<AvoidNode, Vec3> cache) {
+        if (cache.containsKey(node)) return cache.get(node);
+        Vec3 occupy = occupiableNear(vehicle, around, shape, ignoredVehicles);
+        cache.put(node, occupy);
+        return occupy;
+    }
+
+    /** Uses the last accepted floor height so a route follows terrain instead of its starting plane. */
+    static Vec3 terrainProbe(Vec3 horizontalSample, double referenceY) {
+        return new Vec3(horizontalSample.x, referenceY, horizontalSample.z);
+    }
+
+    /** A continuous natural slope is valid; a wall-sized vertical jump is not. */
+    static boolean terrainStepAllowed(double previousY, double nextY) {
+        return Double.isFinite(previousY) && Double.isFinite(nextY)
+                && Math.abs(nextY - previousY) <= MAX_TRAVEL_STEP_HEIGHT;
+    }
+
+    /** The asynchronous grid samples three horizontal blocks at a time. */
+    static double terrainGridStepHeight() {
+        return PATH_STEP * MAX_TRAVEL_STEP_HEIGHT;
     }
 
     private static boolean canOccupy(Entity vehicle, Vec3 position, VehicleShape shape, Set<UUID> ignoredVehicles) {

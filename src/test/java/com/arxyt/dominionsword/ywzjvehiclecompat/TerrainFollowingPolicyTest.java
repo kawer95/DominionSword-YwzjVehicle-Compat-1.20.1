@@ -24,4 +24,18 @@ class TerrainFollowingPolicyTest {
         assertFalse(YwzjVehicleAdapter.terrainStepAllowed(64.0D, 62.5D));
         assertEquals(3.15D, YwzjVehicleAdapter.terrainGridStepHeight(), 1.0E-9D);
     }
+
+    @Test
+    void acceptsSlopeAcrossWholeHullButRejectsWallInFootprint() {
+        assertTrue(YwzjVehicleAdapter.terrainFootprintProfileAllowed(new double[][]{
+                {72.0D, 71.0D, 70.0D},
+                {72.0D, 71.0D, 70.0D},
+                {72.0D, 71.0D, 70.0D}
+        }));
+        assertFalse(YwzjVehicleAdapter.terrainFootprintProfileAllowed(new double[][]{
+                {72.0D, 72.0D, 72.0D},
+                {72.0D, 76.0D, 72.0D},
+                {72.0D, 72.0D, 72.0D}
+        }));
+    }
 }

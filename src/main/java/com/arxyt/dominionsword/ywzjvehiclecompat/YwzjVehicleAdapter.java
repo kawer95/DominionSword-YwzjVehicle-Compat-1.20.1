@@ -3,7 +3,6 @@ package com.arxyt.dominionsword.ywzjvehiclecompat;
 import com.arxyt.dominionsword.api.DominionControlApi;
 import com.arxyt.dominionsword.api.DominionVehicleAdapter;
 import com.arxyt.dominionsword.api.DominionAsyncGridPlanner;
-import com.arxyt.dominionsword.control.PlayerControl;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
@@ -83,15 +82,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String HELI_COMBAT_TARGET = "DominionSwordYwzjHeliCombatTarget";
     /** Active persistent flight tasks only; never retain loaded Entity instances. */
     private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_HELICOPTERS = new ConcurrentHashMap<>();
-    /** Ground tasks need a server-side input pulse before the native vehicle tick. */
-    private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_GROUND_AUTOPILOTS = new ConcurrentHashMap<>();
-    private static final Map<UUID, GroundControlPulse> GROUND_CONTROL_PULSES = new ConcurrentHashMap<>();
-    private static final String OFFLINE_VEHICLE_MOVE = "DominionOfflineVehicleMove";
-    private static final String OFFLINE_VEHICLE_X = "DominionOfflineVehicleX";
-    private static final String OFFLINE_VEHICLE_Y = "DominionOfflineVehicleY";
-    private static final String OFFLINE_VEHICLE_Z = "DominionOfflineVehicleZ";
-    private static final String VEHICLE_CONTROLLER = "dominionsword_controller_player";
-    private static final String PLAYER_SELECTIONS = "DominionSelected";
     private static final double HELI_CLOSE_TRANSLATE_RANGE = 30.0D;
     private static final double HELI_MAX_HORIZONTAL_SPEED = 0.72D;
     private static final double HELI_POSITION_TO_SPEED_GAIN = 0.055D;
@@ -194,8 +184,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final Map<UUID, Long> HELICOPTER_SELECTION_TRACE_TICKS = new ConcurrentHashMap<>();
     private static final int ASYNC_SNAPSHOT_CELLS_PER_TICK = 72;
     private static final String PATH_ASYNC_PENDING = "DominionSwordYwzjPathAsyncPending";
-    private static final String PATH_DEBUG_PHASE = "DominionSwordYwzjPathDebugPhase";
-    private static final String PATH_DEBUG_TICK = "DominionSwordYwzjPathDebugTick";
 
     @Override
     public int priority() {
@@ -481,7 +469,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 stopVehicle(vehicle);
                 return false;
             }
-            registerGroundAutopilot(vehicle);
             ((AbstractVehicle) vehicle).toggleEngine(Boolean.TRUE);
             LagTrace.mark("engine");
 
@@ -697,24 +684,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         });
     }
 
-    /**
-     * Runs before level entities tick. The native tracked-vehicle implementation consumes
-     * ControlUnit flags during its own tick, so writing the flags only at ServerTick.END
-     * can devolve into a single command pulse when the RTS selection changes.
-     */
-    public void tickGroundAutopilot(net.minecraft.server.MinecraftServer server) {
-        if (server == null) return;
-        reapplyGroundControlPulses(server);
-        ACTIVE_GROUND_AUTOPILOTS.entrySet().removeIf(entry -> {
-            ServerLevel level = server.getLevel(entry.getKey());
-            if (level == null) return true;
-            entry.getValue().removeIf(id -> advanceUnselectedGroundTask(server, level, id));
-            return entry.getValue().isEmpty();
-        });
-    }
-
     public void onEntityLoaded(Entity entity) {
-        if (supports(entity) && !isRotaryWingVehicle(entity)) registerGroundAutopilot(entity);
         Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
         if (vehicle == null || !isRotaryWingVehicle(vehicle) || !(driver(vehicle) instanceof Mob pilot)) return;
         String mode = pilot.getPersistentData().getString(HELI_MODE);
@@ -722,10 +692,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     public void onEntityUnloaded(Entity entity) {
-        if (supports(entity) && !isRotaryWingVehicle(entity)) {
-            unregisterGroundAutopilot(entity);
-            GROUND_CONTROL_PULSES.remove(entity.getUUID());
-        }
         Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
         if (vehicle != null) unregisterActiveHelicopter(vehicle);
     }
@@ -1081,78 +1047,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             entries.remove(vehicle.getUUID());
             if (entries.isEmpty()) ACTIVE_HELICOPTERS.remove(vehicle.level().dimension(), entries);
         }
-    }
-
-    private static void registerGroundAutopilot(Entity vehicle) {
-        if (vehicle == null || vehicle.level().isClientSide() || isRotaryWingVehicle(vehicle)
-                || !vehicle.getPersistentData().getBoolean(OFFLINE_VEHICLE_MOVE)) return;
-        ACTIVE_GROUND_AUTOPILOTS.computeIfAbsent(vehicle.level().dimension(), ignored -> ConcurrentHashMap.newKeySet())
-                .add(vehicle.getUUID());
-    }
-
-    private static void unregisterGroundAutopilot(Entity vehicle) {
-        if (vehicle == null) return;
-        Set<UUID> entries = ACTIVE_GROUND_AUTOPILOTS.get(vehicle.level().dimension());
-        if (entries == null) return;
-        entries.remove(vehicle.getUUID());
-        if (entries.isEmpty()) ACTIVE_GROUND_AUTOPILOTS.remove(vehicle.level().dimension(), entries);
-    }
-
-    /** A selected vehicle is still driven by Dominion Sword at ServerTick.END. */
-    private static boolean selectedByCurrentController(net.minecraft.server.MinecraftServer server, Entity vehicle) {
-        CompoundTag task = vehicle.getPersistentData();
-        if (!task.hasUUID(VEHICLE_CONTROLLER)) return false;
-        ServerPlayer controller = server.getPlayerList().getPlayer(task.getUUID(VEHICLE_CONTROLLER));
-        if (controller == null) return false;
-        ListTag selected = controller.getPersistentData().getList(PLAYER_SELECTIONS, Tag.TAG_COMPOUND);
-        for (int i = 0; i < selected.size(); i++) {
-            CompoundTag entry = selected.getCompound(i);
-            if (entry.hasUUID("id") && vehicle.getUUID().equals(entry.getUUID("id"))) return true;
-        }
-        return false;
-    }
-
-    private boolean advanceUnselectedGroundTask(net.minecraft.server.MinecraftServer server, ServerLevel level, UUID id) {
-        Entity vehicle = level.getEntity(id);
-        if (!supports(vehicle) || isRotaryWingVehicle(vehicle) || !vehicle.isAlive()) return true;
-        CompoundTag task = vehicle.getPersistentData();
-        if (!task.getBoolean(OFFLINE_VEHICLE_MOVE)) {
-            GROUND_CONTROL_PULSES.remove(id);
-            return true;
-        }
-        // Never overwrite a real player's manual input. The player can dismount and the
-        // maid pilot will resume the persistent route on the following server tick.
-        if (!(driver(vehicle) instanceof Mob)) {
-            GROUND_CONTROL_PULSES.remove(id);
-            return false;
-        }
-        if (selectedByCurrentController(server, vehicle)) return false;
-        Vec3 target = new Vec3(task.getDouble(OFFLINE_VEHICLE_X), task.getDouble(OFFLINE_VEHICLE_Y), task.getDouble(OFFLINE_VEHICLE_Z));
-        VehicleShape shape = VehicleShape.from(vehicle);
-        Vec3 safeTarget = activeSafeTarget(vehicle, target);
-        if (hasCapturedFinalTarget(vehicle, safeTarget, shape) || flatDistance(vehicle.position(), safeTarget) <= ARRIVE_RADIUS) {
-            stopVehicle(vehicle);
-            PlayerControl.completeRedirectedVehicleMove(vehicle);
-            return true;
-        }
-        move(null, vehicle, target);
-        return false;
-    }
-
-    private static void reapplyGroundControlPulses(net.minecraft.server.MinecraftServer server) {
-        GROUND_CONTROL_PULSES.entrySet().removeIf(entry -> {
-            GroundControlPulse pulse = entry.getValue();
-            ServerLevel level = server.getLevel(pulse.dimension());
-            if (level == null) return true;
-            Entity entity = level.getEntity(entry.getKey());
-            if (!(entity instanceof AbstractVehicle vehicle) || !entity.isAlive()
-                    || !entity.getPersistentData().getBoolean(OFFLINE_VEHICLE_MOVE)) return true;
-            LivingEntity operator = vehicle.controlUnit.getOperator();
-            if (!(operator instanceof Mob) || operator.getVehicle() != vehicle || !pulse.driverId().equals(operator.getUUID())) return true;
-            vehicle.toggleEngine(Boolean.TRUE);
-            setControl(vehicle.controlUnit, pulse.forward(), pulse.backward(), pulse.right(), pulse.left(), pulse.brake());
-            return false;
-        });
     }
 
     private static Vec3 helicopterTaskTarget(Mob mob, Entity vehicle) {
@@ -1913,19 +1807,40 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         int radius = Math.max(1, (int) Math.ceil(shape.radius()));
         int height = Math.max(2, shape.voxelHeight());
         BlockPos center = BlockPos.containing(position.x, position.y + shape.voxelYOffset(), position.z);
-        boolean supported = false;
+        // A vehicle's native physics follows its suspension and can span a natural
+        // slope. A single horizontal AABB cannot: on a long 1:1 descent, terrain at
+        // the uphill side of a wide hull sits several blocks higher than its center.
+        // Keep clearance at the route center, then validate the terrain *profile*
+        // beneath the footprint. This rejects cliffs and walls, not a continuous slope.
+        BlockPos floor = center.below();
+        if (level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) return false;
+        for (int dy = 0; dy < height; dy++) {
+            BlockPos pos = center.above(dy);
+            if (!level.getBlockState(pos).getCollisionShape(level, pos).isEmpty()) return false;
+        }
+        double[][] terrain = new double[radius * 2 + 1][radius * 2 + 1];
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
-                BlockPos floor = center.offset(dx, -1, dz);
-                if (!level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) supported = true;
-                for (int dy = 0; dy < height; dy++) {
-                    BlockPos pos = center.offset(dx, dy, dz);
-                    BlockState state = level.getBlockState(pos);
-                    if (!state.getCollisionShape(level, pos).isEmpty()) return false;
-                }
+                terrain[dx + radius][dz + radius] = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                        center.getX() + dx, center.getZ() + dz);
             }
         }
-        return supported;
+        return terrainFootprintProfileAllowed(terrain);
+    }
+
+    /** Adjacent terrain samples may differ by one natural step, but never by a wall-sized ledge. */
+    static boolean terrainFootprintProfileAllowed(double[][] terrain) {
+        if (terrain == null || terrain.length == 0) return false;
+        for (int x = 0; x < terrain.length; x++) {
+            if (terrain[x] == null || terrain[x].length == 0) return false;
+            for (int z = 0; z < terrain[x].length; z++) {
+                double current = terrain[x][z];
+                if (!Double.isFinite(current)) return false;
+                if (x > 0 && (z >= terrain[x - 1].length || !terrainStepAllowed(current, terrain[x - 1][z]))) return false;
+                if (z > 0 && !terrainStepAllowed(current, terrain[x][z - 1])) return false;
+            }
+        }
+        return true;
     }
 
     private static double otherVehiclePenalty(Entity vehicle, Vec3 position, VehicleShape shape, Set<UUID> ignoredVehicles) {
@@ -2602,16 +2517,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static void applyControl(Entity vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
         if (!(vehicle instanceof AbstractVehicle ywzjVehicle)) return;
         ControlUnit control = ywzjVehicle.controlUnit;
-        setControl(control, forward, backward, right, left, brake);
-        LivingEntity operator = control.getOperator();
-        if (operator instanceof Mob && operator.getVehicle() == vehicle && !vehicle.level().isClientSide()) {
-            GROUND_CONTROL_PULSES.put(vehicle.getUUID(), new GroundControlPulse(vehicle.level().dimension(), operator.getUUID(),
-                    forward, backward, right, left, brake));
-        }
-        alignMainWeaponsForward(vehicle, forward);
-    }
-
-    private static void setControl(ControlUnit control, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
         control.forward = forward;
         control.backward = backward;
         control.right = right;
@@ -2626,6 +2531,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         control.functionalRight = false;
         control.xRotKeep = false;
         control.yRotKeep = false;
+        alignMainWeaponsForward(vehicle, forward);
     }
 
     private static void alignMainWeaponsForward(Entity vehicle, boolean moving) {
@@ -2647,21 +2553,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void stopVehicle(Entity vehicle) {
-        if (vehicle instanceof AbstractVehicle ywzjVehicle) {
-            ywzjVehicle.controlUnit.reset();
-            GROUND_CONTROL_PULSES.remove(vehicle.getUUID());
-        }
+        if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
     }
 
     private static void pathDebug(Entity vehicle, String phase, String format, Object... args) {
         try {
-            if (vehicle != null && !vehicle.level().isClientSide()) {
-                CompoundTag data = vehicle.getPersistentData();
-                long now = vehicle.level().getGameTime();
-                if (phase.equals(data.getString(PATH_DEBUG_PHASE)) && now - data.getLong(PATH_DEBUG_TICK) < 20L) return;
-                data.putString(PATH_DEBUG_PHASE, phase);
-                data.putLong(PATH_DEBUG_TICK, now);
-            }
             String message = args == null || args.length == 0 ? format : String.format(Locale.ROOT, format, args);
             System.out.println(String.format(Locale.ROOT, "[DS-YWZJ-PATH] phase=%s vehicle=%s pos=%s yaw=%.1f speed=%.3f %s",
                     phase,
@@ -3327,8 +3223,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private record ClassNameKey(Class<?> type, String name) {}
     private record FieldKey(Class<?> type, String name) {}
-    private record GroundControlPulse(ResourceKey<Level> dimension, UUID driverId, boolean forward, boolean backward,
-                                      boolean right, boolean left, boolean brake) {}
     private record MethodKey(Class<?> type, String name, List<Class<?>> parameterTypes) {
         private static MethodKey of(Class<?> type, String name, Class<?>... parameterTypes) {
             return new MethodKey(type, name, List.of(parameterTypes));

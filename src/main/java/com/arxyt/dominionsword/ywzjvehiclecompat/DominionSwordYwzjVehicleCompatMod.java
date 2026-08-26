@@ -23,8 +23,11 @@ public final class DominionSwordYwzjVehicleCompatMod {
     }
 
     private void onServerTick(TickEvent.ServerTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) return;
-        vehicleAdapter.tickHelicopterAutopilot(event.getServer());
+        if (event.phase == TickEvent.Phase.START) {
+            vehicleAdapter.tickGroundAutopilot(event.getServer());
+        } else {
+            vehicleAdapter.tickHelicopterAutopilot(event.getServer());
+        }
     }
 
     private void onEntityJoin(EntityJoinLevelEvent event) {

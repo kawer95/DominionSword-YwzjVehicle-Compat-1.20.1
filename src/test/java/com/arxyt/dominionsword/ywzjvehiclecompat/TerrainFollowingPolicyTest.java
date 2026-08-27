@@ -40,8 +40,8 @@ class TerrainFollowingPolicyTest {
     }
 
     @Test
-    void doesNotThreePointTurnForAnAngledRouteWaypoint() {
+    void leavesTurningToForwardSteeringInsteadOfAngleBasedReverse() {
         assertFalse(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, false, true));
-        assertTrue(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, true, true));
+        assertFalse(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, true, true));
     }
 }

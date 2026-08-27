@@ -546,7 +546,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             boolean slow = distance <= SLOW_RADIUS || absYaw >= TURN_IN_PLACE_ANGLE;
             double routeLimit = routeCurvatureSpeedLimit(vehicle, driveTarget, speed);
             boolean brake = (finalTarget && shouldBrake(vehicle, distance, speed, absYaw)) || speed > routeLimit || shouldYield(vehicle, driveTarget, shape);
-            boolean forward = !brake && !closeBehind && absYaw < 115.0D;
+            // A route point is a forward steering instruction. Target yaw alone says nothing
+            // about whether the car is physically boxed in.
+            boolean forward = !brake && !closeBehind;
             boolean backward = !brake && closeBehind;
             boolean turn = absYaw > (slow ? 4.0D : 8.0D);
             if (finalTarget && !brake && distance <= Math.max(ARRIVE_RADIUS + 1.25D, captureDistance)) {
@@ -565,14 +567,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             }
 
             boolean reverseSteer = false;
-            if (!forward && !backward && !brake && absYaw >= TURN_IN_PLACE_ANGLE) {
-                // Tracked vehicles rotate in place; wheeled vehicles with a large turn radius back toward
-                // the target instead of a forward crawl (which barely turns them at large turn radii).
-                if (!isTrackedVehicle(vehicle)) {
-                    backward = true;
-                    reverseSteer = true;
-                }
-            }
 
             boolean steerRight = turn && (reverseSteer ? yawDiff < 0.0F : yawDiff > 0.0F);
             boolean steerLeft = turn && (reverseSteer ? yawDiff > 0.0F : yawDiff < 0.0F);
@@ -1421,6 +1415,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 && vehicle.getPersistentData().contains(PATH_POINTS, Tag.TAG_LIST)
                 && !vehicle.getPersistentData().getBoolean(PATH_BLOCKED)) return;
         VehicleShape shape = VehicleShape.from(vehicle);
+        traceRouteShape(vehicle, shape);
         LagTrace.mark("shape");
         Vec3 safe = safeTargetNear(vehicle, target, shape, ignoredVehicles);
         LagTrace.mark("safe_target");
@@ -1749,8 +1744,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static Vec3 safeTargetNear(Entity vehicle, Vec3 target, VehicleShape shape, Set<UUID> ignoredVehicles) {
         Vec3 direct = occupiableNear(vehicle, target, shape, ignoredVehicles);
-        if (direct != null) return direct;
         Vec3 origin = vehicle.position();
+        if (direct != null && canTravelDirect(vehicle, origin, direct, shape,
+                Math.max(PATH_LOOKAHEAD_MIN, flatDistance(origin, direct) + shape.radius()))) return direct;
         List<SafeCandidate> candidates = new ArrayList<>();
         for (double radius = PATH_STEP; radius <= Math.max(18.0D, shape.radius() * 3.0D); radius += PATH_STEP) {
             for (int angle = 0; angle < 360; angle += 20) {
@@ -1765,17 +1761,14 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
         if (candidates.isEmpty()) return target;
         candidates.sort(Comparator.comparingDouble(SafeCandidate::score));
-        SafeCandidate best = candidates.get(0);
-        int checkLimit = Math.min(5, candidates.size());
-        for (int i = 0; i < checkLimit; i++) {
-            SafeCandidate candidate = candidates.get(i);
+        for (SafeCandidate candidate : candidates) {
             if (canTravelDirect(vehicle, origin, candidate.position(), shape, Math.max(PATH_LOOKAHEAD_MIN, flatDistance(origin, candidate.position()) + shape.radius()))) {
-                double score = candidate.score() - 4.0D;
-                if (score < best.score()) best = new SafeCandidate(candidate.position(), score);
-                break;
+                return candidate.position();
             }
         }
-        return best.position();
+        // The planner may still route around a real obstacle, but never claim that a
+        // disconnected roof/platform is an immediately reachable destination.
+        return candidates.get(0).position();
     }
 
     private static Vec3 occupiableForTravel(Entity vehicle, Vec3 around, VehicleShape shape, Set<UUID> ignoredVehicles, double referenceY) {
@@ -1855,7 +1848,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         // this strict volume check before 1.2.49; applying the tracked-vehicle
         // suspension profile to it made the planner approve positions its chassis
         // could not actually drive through.  Keep its proven pre-1.2.49 behavior.
-        if (!isTrackedVehicle(vehicle)) return canOccupyStrictVehicleSpace(level, position, shape);
+        if (!isTrackedVehicle(vehicle)) return canOccupyStrictVehicleSpace(level, vehicle, position, shape);
 
         int radius = Math.max(1, (int) Math.ceil(shape.radius()));
         int height = Math.max(2, shape.voxelHeight());
@@ -1882,22 +1875,18 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     /** Original full-hull collision test used by rigid wheeled vehicles. */
-    private static boolean canOccupyStrictVehicleSpace(ServerLevel level, Vec3 position, VehicleShape shape) {
-        int radius = Math.max(1, (int) Math.ceil(shape.radius()));
-        int height = Math.max(2, shape.voxelHeight());
-        BlockPos center = BlockPos.containing(position.x, position.y + shape.voxelYOffset(), position.z);
-        boolean supported = false;
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                BlockPos floor = center.offset(dx, -1, dz);
-                if (!level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) supported = true;
-                for (int dy = 0; dy < height; dy++) {
-                    BlockPos pos = center.offset(dx, dy, dz);
-                    if (!level.getBlockState(pos).getCollisionShape(level, pos).isEmpty()) return false;
-                }
-            }
-        }
-        return supported;
+    private static boolean canOccupyStrictVehicleSpace(ServerLevel level, Entity vehicle, Vec3 position, VehicleShape shape) {
+        // The old test inflated a wheeled car into a square based on every decorative OBB.
+        // Query the actual Entity collision box instead: it is the footprint native driving
+        // can genuinely pass through.
+        AABB body = shape.aabbAt(position);
+        if (!level.noCollision(vehicle, body)) return false;
+        double insetX = Math.min(0.12D, Math.max(0.0D, body.getXsize() * 0.20D));
+        double insetZ = Math.min(0.12D, Math.max(0.0D, body.getZsize() * 0.20D));
+        AABB supportProbe = new AABB(
+                body.minX + insetX, body.minY - 0.18D, body.minZ + insetZ,
+                body.maxX - insetX, body.minY - 0.02D, body.maxZ - insetZ);
+        return !level.noCollision(vehicle, supportProbe);
     }
 
     /** Adjacent terrain samples may differ by one natural step, but never by a wall-sized ledge. */
@@ -2435,23 +2424,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (cannotArc) forwardEta += 80.0D;
         double reverseEta = distance / 0.06D + Math.abs(Mth.wrapDegrees(yawDiff - 180.0F)) / 8.0D + stopPenalty * 1.15D;
         double turnAroundEta = stopPenalty + 50.0D + distance / 0.10D;
-        DriveMode mode;
-        if (shortReverseTarget) {
-            mode = DriveMode.REVERSE_SHORT;
-        } else if (cannotArc) {
-            mode = DriveMode.THREE_POINT;
-        } else if (!tracked && rearTarget && distance > CLOSE_REVERSE_RADIUS) {
-            mode = DriveMode.TURN_AROUND;
-        } else {
-            mode = DriveMode.FORWARD;
-        }
-        return new DriveDecision(mode, forwardEta, reverseEta, turnAroundEta);
+        // Do not infer a reverse manoeuvre from a waypoint's relative angle. A waypoint is
+        // normally ahead on the drivable corridor even if it is not yet inside the current
+        // turning circle. Native collision/stuck recovery is the only valid reason to back up.
+        return new DriveDecision(DriveMode.FORWARD, forwardEta, reverseEta, turnAroundEta);
     }
 
     /** A route waypoint is a steering hint; reserve a K-turn for a real final target. */
     static boolean shouldUseThreePointTurn(boolean wheeled, boolean shortReverseTarget, boolean threePointCooldown,
                                            boolean finalTarget, boolean cannotArcToTarget) {
-        return wheeled && !shortReverseTarget && !threePointCooldown && finalTarget && cannotArcToTarget;
+        return false;
     }
 
     private static double estimatedTurnRadius(Entity vehicle, VehicleShape shape) {
@@ -2973,6 +2955,17 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return obbAabb(obb);
     }
 
+    private static void traceRouteShape(Entity vehicle, VehicleShape shape) {
+        AABB entityBox = vehicle.getBoundingBox();
+        pathDebug(vehicle, "SHAPE", "wheeled=%s entity=%s mainObb=%s allObb=%s routeBox=%s radius=%.2f exactNativeBox=%s",
+                !isTrackedVehicle(vehicle), boxSize(entityBox), boxSize(mainObbAabb(vehicle)), boxSize(allObbAabb(vehicle)),
+                boxSize(shape.aabbAt(vehicle.position())), shape.radius(), shape.exactNativeBox());
+    }
+
+    private static String boxSize(AABB box) {
+        return box == null ? "none" : String.format(Locale.ROOT, "%.2fx%.2fx%.2f", box.getXsize(), box.getYsize(), box.getZsize());
+    }
+
     private static AABB allComponentObbAabb(Entity vehicle) {
         AABB result = null;
         if (vehicle instanceof AbstractVehicle ywzjVehicle && ywzjVehicle.getVehicleCubeOBBs() != null) {
@@ -3111,19 +3104,28 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
     }
 
-    private record VehicleShape(double radius, double minYOffset, double maxYOffset, double voxelYOffset, int voxelHeight) {
+    private record VehicleShape(double radius, double minYOffset, double maxYOffset, double voxelYOffset, int voxelHeight,
+                                AABB nativeBox, Vec3 nativeBoxOrigin, boolean exactNativeBox) {
         static VehicleShape from(Entity vehicle) {
-            AABB obb = allObbAabb(vehicle);
-            AABB box = obb == null ? vehicle.getBoundingBox() : union(obb, vehicle.getBoundingBox());
-            double radius = Math.max(1.5D, Math.max(box.getXsize(), box.getZsize()) * 0.5D + 1.0D);
+            AABB entityBox = vehicle.getBoundingBox();
+            boolean wheeled = !isTrackedVehicle(vehicle);
+            // getOBBs contains turrets, guns and decorations. Those are valid selection
+            // components but are not a road-width collision hull for a wheeled vehicle.
+            AABB obb = wheeled ? null : allObbAabb(vehicle);
+            AABB box = obb == null ? entityBox : union(obb, entityBox);
+            double radius = wheeled
+                    ? Math.max(1.0D, Math.min(box.getXsize(), box.getZsize()) * 0.5D + 0.10D)
+                    : Math.max(1.5D, Math.max(box.getXsize(), box.getZsize()) * 0.5D + 1.0D);
             double minYOffset = Math.min(-0.1D, box.minY - vehicle.getY());
             double maxYOffset = Math.max(1.2D, box.maxY - vehicle.getY() + 0.25D);
             double voxelYOffset = Math.max(0.0D, minYOffset + 0.18D);
             int voxelHeight = Math.max(2, Mth.ceil(maxYOffset - voxelYOffset + 0.15D));
-            return new VehicleShape(radius, minYOffset, maxYOffset, voxelYOffset, voxelHeight);
+            return new VehicleShape(radius, minYOffset, maxYOffset, voxelYOffset, voxelHeight,
+                    wheeled ? entityBox : null, vehicle.position(), wheeled);
         }
 
         AABB aabbAt(Vec3 position) {
+            if (exactNativeBox && nativeBox != null && nativeBoxOrigin != null) return nativeBox.move(position.subtract(nativeBoxOrigin));
             return new AABB(position.x - radius, position.y + minYOffset, position.z - radius,
                     position.x + radius, position.y + maxYOffset, position.z + radius);
         }

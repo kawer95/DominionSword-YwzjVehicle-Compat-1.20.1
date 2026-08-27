@@ -1804,6 +1804,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static boolean canOccupyVoxelVehicleSpace(Entity vehicle, Vec3 position, VehicleShape shape) {
         if (!(vehicle.level() instanceof ServerLevel level)) return true;
+        // WheeledVehicle uses a rigid native collision chassis.  It was working with
+        // this strict volume check before 1.2.49; applying the tracked-vehicle
+        // suspension profile to it made the planner approve positions its chassis
+        // could not actually drive through.  Keep its proven pre-1.2.49 behavior.
+        if (!isTrackedVehicle(vehicle)) return canOccupyStrictVehicleSpace(level, position, shape);
+
         int radius = Math.max(1, (int) Math.ceil(shape.radius()));
         int height = Math.max(2, shape.voxelHeight());
         BlockPos center = BlockPos.containing(position.x, position.y + shape.voxelYOffset(), position.z);
@@ -1826,6 +1832,25 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             }
         }
         return terrainFootprintProfileAllowed(terrain);
+    }
+
+    /** Original full-hull collision test used by rigid wheeled vehicles. */
+    private static boolean canOccupyStrictVehicleSpace(ServerLevel level, Vec3 position, VehicleShape shape) {
+        int radius = Math.max(1, (int) Math.ceil(shape.radius()));
+        int height = Math.max(2, shape.voxelHeight());
+        BlockPos center = BlockPos.containing(position.x, position.y + shape.voxelYOffset(), position.z);
+        boolean supported = false;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                BlockPos floor = center.offset(dx, -1, dz);
+                if (!level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) supported = true;
+                for (int dy = 0; dy < height; dy++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    if (!level.getBlockState(pos).getCollisionShape(level, pos).isEmpty()) return false;
+                }
+            }
+        }
+        return supported;
     }
 
     /** Adjacent terrain samples may differ by one natural step, but never by a wall-sized ledge. */

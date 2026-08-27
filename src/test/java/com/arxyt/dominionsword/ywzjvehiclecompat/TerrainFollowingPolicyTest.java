@@ -38,4 +38,10 @@ class TerrainFollowingPolicyTest {
                 {72.0D, 72.0D, 72.0D}
         }));
     }
+
+    @Test
+    void doesNotThreePointTurnForAnAngledRouteWaypoint() {
+        assertFalse(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, false, true));
+        assertTrue(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, true, true));
+    }
 }

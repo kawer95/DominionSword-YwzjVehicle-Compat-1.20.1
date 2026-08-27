@@ -2380,7 +2380,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         boolean tracked = isTrackedVehicle(vehicle);
         boolean shortReverseTarget = isShortReverseTarget(absYaw, distance, shape);
         boolean threePointCooldown = vehicle.level().getGameTime() < vehicle.getPersistentData().getLong(THREE_POINT_GIVE_UP_UNTIL);
-        boolean cannotArc = !tracked && !shortReverseTarget && !threePointCooldown && cannotArcToTarget(vehicle, absYaw, distance, shape);
+        boolean cannotArc = shouldUseThreePointTurn(!tracked, shortReverseTarget, threePointCooldown,
+                finalTarget, cannotArcToTarget(vehicle, absYaw, distance, shape));
         double turnPenalty = absYaw / 8.0D;
         double stopPenalty = Math.max(0.0D, speed) * 18.0D;
         double forwardEta = distance / 0.10D + turnPenalty + stopPenalty;
@@ -2398,6 +2399,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             mode = DriveMode.FORWARD;
         }
         return new DriveDecision(mode, forwardEta, reverseEta, turnAroundEta);
+    }
+
+    /** A route waypoint is a steering hint; reserve a K-turn for a real final target. */
+    static boolean shouldUseThreePointTurn(boolean wheeled, boolean shortReverseTarget, boolean threePointCooldown,
+                                           boolean finalTarget, boolean cannotArcToTarget) {
+        return wheeled && !shortReverseTarget && !threePointCooldown && finalTarget && cannotArcToTarget;
     }
 
     private static double estimatedTurnRadius(Entity vehicle, VehicleShape shape) {

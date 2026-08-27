@@ -51,6 +51,7 @@ import org.slf4j.Logger;
 import org.ywzj.vehicle.entity.vehicle.AbstractVehicle;
 import org.ywzj.vehicle.entity.vehicle.FixedWingVehicle;
 import org.ywzj.vehicle.entity.vehicle.RotaryWingVehicle;
+import org.ywzj.vehicle.entity.vehicle.WheeledVehicle;
 import org.ywzj.vehicle.vehicle.control.ControlUnit;
 import org.ywzj.vehicle.vehicle.part.WeaponUnit;
 import org.ywzj.vehicle.vehicle.pojo.AimContext;
@@ -82,6 +83,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String HELI_COMBAT_TARGET = "DominionSwordYwzjHeliCombatTarget";
     /** Active persistent flight tasks only; never retain loaded Entity instances. */
     private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_HELICOPTERS = new ConcurrentHashMap<>();
+    /** Last autonomous command for a wheeled chassis, replayed before its native physics tick. */
+    private static final Map<ResourceKey<Level>, Map<UUID, WheeledControlState>> ACTIVE_WHEELED_CONTROLS = new ConcurrentHashMap<>();
+    private static final Map<UUID, Long> WHEELED_CONTROL_TRACE_TICKS = new ConcurrentHashMap<>();
     private static final double HELI_CLOSE_TRANSLATE_RANGE = 30.0D;
     private static final double HELI_MAX_HORIZONTAL_SPEED = 0.72D;
     private static final double HELI_POSITION_TO_SPEED_GAIN = 0.055D;
@@ -684,6 +688,31 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         });
     }
 
+    /**
+     * The native wheeled implementation applies engine force only while its control
+     * flags are set in that exact entity tick. Dominion's route planner deliberately
+     * runs less often, so replay the latest command just before entity physics.
+     */
+    public void tickWheeledControl(net.minecraft.server.MinecraftServer server) {
+        if (server == null) return;
+        ACTIVE_WHEELED_CONTROLS.entrySet().removeIf(entry -> {
+            ServerLevel level = server.getLevel(entry.getKey());
+            if (level == null) return true;
+            Map<UUID, WheeledControlState> controls = entry.getValue();
+            controls.entrySet().removeIf(controlEntry -> {
+                Entity vehicle = level.getEntity(controlEntry.getKey());
+                if (!(vehicle instanceof WheeledVehicle wheeled) || !vehicle.isAlive()) return true;
+                // Never synthesize input for a player-operated vehicle.
+                if (!(driver(vehicle) instanceof Mob)) return true;
+                WheeledControlState control = controlEntry.getValue();
+                writeControl(wheeled, control.forward(), control.backward(), control.right(), control.left(), control.brake());
+                traceWheeledControl(vehicle, wheeled, control);
+                return false;
+            });
+            return controls.isEmpty();
+        });
+    }
+
     public void onEntityLoaded(Entity entity) {
         Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
         if (vehicle == null || !isRotaryWingVehicle(vehicle) || !(driver(vehicle) instanceof Mob pilot)) return;
@@ -694,6 +723,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     public void onEntityUnloaded(Entity entity) {
         Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
         if (vehicle != null) unregisterActiveHelicopter(vehicle);
+        if (entity instanceof WheeledVehicle) unregisterActiveWheeledControl(entity);
     }
 
     private static boolean moveHelicopter(Entity vehicle, Vec3 target) {
@@ -1047,6 +1077,23 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             entries.remove(vehicle.getUUID());
             if (entries.isEmpty()) ACTIVE_HELICOPTERS.remove(vehicle.level().dimension(), entries);
         }
+    }
+
+    private static void registerActiveWheeledControl(Entity vehicle, boolean forward, boolean backward,
+                                                     boolean right, boolean left, boolean brake) {
+        if (!(vehicle instanceof WheeledVehicle) || vehicle.level().isClientSide()) return;
+        ACTIVE_WHEELED_CONTROLS.computeIfAbsent(vehicle.level().dimension(), ignored -> new ConcurrentHashMap<>())
+                .put(vehicle.getUUID(), new WheeledControlState(forward, backward, right, left, brake));
+    }
+
+    private static void unregisterActiveWheeledControl(Entity vehicle) {
+        if (vehicle == null) return;
+        Map<UUID, WheeledControlState> entries = ACTIVE_WHEELED_CONTROLS.get(vehicle.level().dimension());
+        if (entries != null) {
+            entries.remove(vehicle.getUUID());
+            if (entries.isEmpty()) ACTIVE_WHEELED_CONTROLS.remove(vehicle.level().dimension(), entries);
+        }
+        WHEELED_CONTROL_TRACE_TICKS.remove(vehicle.getUUID());
     }
 
     private static Vec3 helicopterTaskTarget(Mob mob, Entity vehicle) {
@@ -2548,7 +2595,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void applyControl(Entity vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
         if (!(vehicle instanceof AbstractVehicle ywzjVehicle)) return;
-        ControlUnit control = ywzjVehicle.controlUnit;
+        writeControl(ywzjVehicle, forward, backward, right, left, brake);
+        registerActiveWheeledControl(vehicle, forward, backward, right, left, brake);
+        alignMainWeaponsForward(vehicle, forward);
+    }
+
+    private static void writeControl(AbstractVehicle vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
+        ControlUnit control = vehicle.controlUnit;
         control.forward = forward;
         control.backward = backward;
         control.right = right;
@@ -2563,7 +2616,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         control.functionalRight = false;
         control.xRotKeep = false;
         control.yRotKeep = false;
-        alignMainWeaponsForward(vehicle, forward);
+    }
+
+    private static void traceWheeledControl(Entity vehicle, WheeledVehicle wheeled, WheeledControlState control) {
+        long now = vehicle.level().getGameTime();
+        Long previous = WHEELED_CONTROL_TRACE_TICKS.get(vehicle.getUUID());
+        if (previous != null && now - previous < 20L) return;
+        WHEELED_CONTROL_TRACE_TICKS.put(vehicle.getUUID(), now);
+        pathDebug(vehicle, "WHEELED_TICK_CONTROL", "forward=%s backward=%s right=%s left=%s brake=%s power=%.1f engine=%s",
+                control.forward(), control.backward(), control.right(), control.left(), control.brake(),
+                wheeled.getPower(), wheeled.isEngineOn());
     }
 
     private static void alignMainWeaponsForward(Entity vehicle, boolean moving) {
@@ -2585,8 +2647,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void stopVehicle(Entity vehicle) {
+        unregisterActiveWheeledControl(vehicle);
         if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
     }
+
+    private record WheeledControlState(boolean forward, boolean backward, boolean right, boolean left, boolean brake) {}
 
     private static void pathDebug(Entity vehicle, String phase, String format, Object... args) {
         try {

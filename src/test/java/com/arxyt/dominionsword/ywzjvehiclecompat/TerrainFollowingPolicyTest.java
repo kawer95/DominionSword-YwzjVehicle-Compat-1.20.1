@@ -53,4 +53,11 @@ class TerrainFollowingPolicyTest {
         assertFalse(YwzjVehicleAdapter.shouldPivotTrackedVehicle(true, 90.0D, 40.0D, 18.0D, true));
         assertFalse(YwzjVehicleAdapter.shouldPivotTrackedVehicle(false, 90.0D, 8.0D, 18.0D, false));
     }
+
+    @Test
+    void usesPivotBeforeRouteDetourWhenTrackedVehicleHitsAnObstacle() {
+        assertTrue(YwzjVehicleAdapter.shouldAttemptTrackedEscapePivot(true, true));
+        assertFalse(YwzjVehicleAdapter.shouldAttemptTrackedEscapePivot(true, false));
+        assertFalse(YwzjVehicleAdapter.shouldAttemptTrackedEscapePivot(false, true));
+    }
 }

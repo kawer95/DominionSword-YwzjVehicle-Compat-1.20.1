@@ -116,6 +116,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final double CLOSE_REVERSE_RADIUS = 25.0D;
     private static final double TURN_IN_PLACE_ANGLE = 55.0D;
     private static final double TRACKED_PIVOT_CORNER_ANGLE = 82.0D;
+    private static final double TRACKED_ESCAPE_MIN_ANGLE = 28.0D;
+    private static final long TRACKED_ESCAPE_PIVOT_TICKS = 50L;
     private static final double REVERSE_ANGLE = 150.0D;
     private static final double SIDE_REVERSE_ANGLE = 100.0D;
     private static final double ATTACK_RANGE = 96.0D;
@@ -161,6 +163,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final long THREE_POINT_GIVE_UP_COOLDOWN_TICKS = 40L;
     private static final String THREE_POINT_TARGET_X = "DominionSwordYwzjThreePointTargetX";
     private static final String THREE_POINT_TARGET_Z = "DominionSwordYwzjThreePointTargetZ";
+    private static final String TRACKED_ESCAPE_PIVOT_YAW = "DominionSwordYwzjTrackedEscapePivotYaw";
+    private static final String TRACKED_ESCAPE_PIVOT_UNTIL = "DominionSwordYwzjTrackedEscapePivotUntil";
     private static final String CAPTURED_TARGET_X = "DominionSwordYwzjCapturedTargetX";
     private static final String CAPTURED_TARGET_Z = "DominionSwordYwzjCapturedTargetZ";
     private static final String EFFECTIVE_ARRIVE_SINCE = "DominionSwordYwzjEffectiveArriveSince";
@@ -520,6 +524,18 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 captureFinalTarget(vehicle, safeTarget);
                 stopVehicle(vehicle);
                 pathDebug(vehicle, "FINAL_CAPTURE_STOP", "target=%s pos=%s dist=%.2f speed=%.3f capture=%.2f", fmt(safeTarget), fmt(vehicle.position()), distance, speed, captureDistance);
+                return true;
+            }
+            float escapePivotYaw = trackedEscapePivotYaw(vehicle, driveTarget, shape);
+            if (Float.isFinite(escapePivotYaw)) {
+                float escapeYawDiff = Mth.wrapDegrees(escapePivotYaw - vehicle.getYRot());
+                boolean steerRight = escapeYawDiff > 0.0F;
+                boolean steerLeft = escapeYawDiff < 0.0F;
+                applyControl(vehicle, false, false, steerRight, steerLeft, false);
+                pathDebug(vehicle, "TRACK_ESCAPE_PIVOT", "target=%s safe=%s targetYaw=%.1f yawDiff=%.1f collision=%s keys=%d",
+                        fmt(driveTarget), fmt(safeTarget), escapePivotYaw, escapeYawDiff, vehicle.horizontalCollision,
+                        (int) packControl(false, false, steerRight, steerLeft, false));
+                LagTrace.mark("track_escape_pivot");
                 return true;
             }
             boolean trackedPivot = shouldPivotTrackedVehicle(isTrackedVehicle(vehicle), absYaw, distance,
@@ -2467,6 +2483,54 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return intermediateWaypoint && absYaw >= TRACKED_PIVOT_CORNER_ANGLE && distance <= pivotRange * 1.5D;
     }
 
+    static boolean shouldAttemptTrackedEscapePivot(boolean tracked, boolean horizontalCollision) {
+        return tracked && horizontalCollision;
+    }
+
+    /**
+     * A tree or other narrow obstacle can block the nose even when moving it aside only needs
+     * a small change of heading.  Keep an escape heading briefly so the chassis cannot alternate
+     * left/right every planner tick, then let ordinary forward steering resume.
+     */
+    private static float trackedEscapePivotYaw(Entity vehicle, Vec3 driveTarget, VehicleShape shape) {
+        CompoundTag data = vehicle.getPersistentData();
+        long now = vehicle.level().getGameTime();
+        if (data.contains(TRACKED_ESCAPE_PIVOT_YAW) && now <= data.getLong(TRACKED_ESCAPE_PIVOT_UNTIL)) {
+            float storedYaw = data.getFloat(TRACKED_ESCAPE_PIVOT_YAW);
+            if (Math.abs(Mth.wrapDegrees(storedYaw - vehicle.getYRot())) > 4.0F) return storedYaw;
+            clearTrackedEscapePivot(data);
+        } else {
+            clearTrackedEscapePivot(data);
+        }
+        if (!shouldAttemptTrackedEscapePivot(isTrackedVehicle(vehicle), vehicle.horizontalCollision)) return Float.NaN;
+
+        float chosenYaw = chooseTrackedEscapeYaw(vehicle, driveTarget, shape);
+        if (!Float.isFinite(chosenYaw)) return Float.NaN;
+        data.putFloat(TRACKED_ESCAPE_PIVOT_YAW, chosenYaw);
+        data.putLong(TRACKED_ESCAPE_PIVOT_UNTIL, now + TRACKED_ESCAPE_PIVOT_TICKS);
+        return chosenYaw;
+    }
+
+    private static float chooseTrackedEscapeYaw(Entity vehicle, Vec3 driveTarget, VehicleShape shape) {
+        float desiredYaw = yawTo(driveTarget.subtract(vehicle.position()).multiply(1.0D, 0.0D, 1.0D));
+        float currentYaw = vehicle.getYRot();
+        double probeDistance = Mth.clamp(shape.radius() + 2.0D, 3.0D, 8.0D);
+        double[] offsets = {0.0D, 30.0D, -30.0D, 50.0D, -50.0D, 70.0D, -70.0D};
+        for (double offset : offsets) {
+            float candidateYaw = Mth.wrapDegrees(desiredYaw + (float) offset);
+            if (Math.abs(Mth.wrapDegrees(candidateYaw - currentYaw)) < TRACKED_ESCAPE_MIN_ANGLE) continue;
+            Vec3 forward = Vec3.directionFromRotation(0.0F, candidateYaw).multiply(1.0D, 0.0D, 1.0D).normalize();
+            Vec3 probe = vehicle.position().add(forward.scale(probeDistance));
+            if (canTravelDirect(vehicle, vehicle.position(), probe, shape, probeDistance)) return candidateYaw;
+        }
+        return Float.NaN;
+    }
+
+    private static void clearTrackedEscapePivot(CompoundTag data) {
+        data.remove(TRACKED_ESCAPE_PIVOT_YAW);
+        data.remove(TRACKED_ESCAPE_PIVOT_UNTIL);
+    }
+
     private static double trackedPivotRange(VehicleShape shape) {
         return Mth.clamp(shape.radius() * 3.0D + 8.0D, 12.0D, 24.0D);
     }
@@ -2665,6 +2729,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void stopVehicle(Entity vehicle) {
         unregisterActiveWheeledControl(vehicle);
+        clearTrackedEscapePivot(vehicle.getPersistentData());
         if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
     }
 

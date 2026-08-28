@@ -115,6 +115,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final double SLOW_RADIUS = 8.0D;
     private static final double CLOSE_REVERSE_RADIUS = 25.0D;
     private static final double TURN_IN_PLACE_ANGLE = 55.0D;
+    private static final double TRACKED_PIVOT_CORNER_ANGLE = 82.0D;
     private static final double REVERSE_ANGLE = 150.0D;
     private static final double SIDE_REVERSE_ANGLE = 100.0D;
     private static final double ATTACK_RANGE = 96.0D;
@@ -519,6 +520,22 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 captureFinalTarget(vehicle, safeTarget);
                 stopVehicle(vehicle);
                 pathDebug(vehicle, "FINAL_CAPTURE_STOP", "target=%s pos=%s dist=%.2f speed=%.3f capture=%.2f", fmt(safeTarget), fmt(vehicle.position()), distance, speed, captureDistance);
+                return true;
+            }
+            boolean trackedPivot = shouldPivotTrackedVehicle(isTrackedVehicle(vehicle), absYaw, distance,
+                    trackedPivotRange(shape), !finalTarget);
+            if (trackedPivot) {
+                clearThreePointState(vehicle);
+                boolean steerRight = yawDiff > 0.0F;
+                boolean steerLeft = yawDiff < 0.0F;
+                // TrackedVehicle turns on the spot when only left/right is pressed.  Do not
+                // combine it with forward/backward: a tight corner must be aligned before
+                // the hull enters the narrow corridor.
+                applyControl(vehicle, false, false, steerRight, steerLeft, false);
+                pathDebug(vehicle, "TRACK_PIVOT", "target=%s safe=%s yawDiff=%.1f absYaw=%.1f dist=%.2f range=%.2f keys=%d",
+                        fmt(driveTarget), fmt(safeTarget), yawDiff, absYaw, distance, trackedPivotRange(shape),
+                        (int) packControl(false, false, steerRight, steerLeft, false));
+                LagTrace.mark("track_pivot");
                 return true;
             }
             DriveDecision driveDecision = decideDriveMode(vehicle, yawDiff, absYaw, distance, speed, shape, finalTarget);
@@ -2434,6 +2451,24 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     static boolean shouldUseThreePointTurn(boolean wheeled, boolean shortReverseTarget, boolean threePointCooldown,
                                            boolean finalTarget, boolean cannotArcToTarget) {
         return false;
+    }
+
+    /**
+     * A tracked chassis can rotate without translating.  Preserve ordinary rolling steering
+     * for small corrections and distant targets, but align it before entering a close corner.
+     */
+    static boolean shouldPivotTrackedVehicle(boolean tracked, double absYaw, double distance, double pivotRange,
+                                             boolean intermediateWaypoint) {
+        if (!tracked || absYaw < TURN_IN_PLACE_ANGLE) return false;
+        if (distance <= pivotRange) return true;
+        // A generated intermediate point is normally the mouth of a constrained route.  A
+        // right-angle turn may safely be prepared a little earlier, while distant targets
+        // still use normal forward steering.
+        return intermediateWaypoint && absYaw >= TRACKED_PIVOT_CORNER_ANGLE && distance <= pivotRange * 1.5D;
+    }
+
+    private static double trackedPivotRange(VehicleShape shape) {
+        return Mth.clamp(shape.radius() * 3.0D + 8.0D, 12.0D, 24.0D);
     }
 
     private static double estimatedTurnRadius(Entity vehicle, VehicleShape shape) {

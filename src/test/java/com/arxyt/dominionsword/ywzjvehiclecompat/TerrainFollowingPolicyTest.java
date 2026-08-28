@@ -44,4 +44,13 @@ class TerrainFollowingPolicyTest {
         assertFalse(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, false, true));
         assertFalse(YwzjVehicleAdapter.shouldUseThreePointTurn(true, false, false, true, true));
     }
+
+    @Test
+    void pivotsTrackedVehiclesOnlyForCloseLargeTurns() {
+        assertTrue(YwzjVehicleAdapter.shouldPivotTrackedVehicle(true, 90.0D, 14.0D, 18.0D, false));
+        assertTrue(YwzjVehicleAdapter.shouldPivotTrackedVehicle(true, 90.0D, 26.0D, 18.0D, true));
+        assertFalse(YwzjVehicleAdapter.shouldPivotTrackedVehicle(true, 42.0D, 8.0D, 18.0D, false));
+        assertFalse(YwzjVehicleAdapter.shouldPivotTrackedVehicle(true, 90.0D, 40.0D, 18.0D, true));
+        assertFalse(YwzjVehicleAdapter.shouldPivotTrackedVehicle(false, 90.0D, 8.0D, 18.0D, false));
+    }
 }

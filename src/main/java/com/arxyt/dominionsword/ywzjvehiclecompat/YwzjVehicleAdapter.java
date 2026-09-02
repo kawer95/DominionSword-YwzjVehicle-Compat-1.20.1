@@ -1502,7 +1502,17 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static Vec3 navigationTarget(ServerPlayer player, Entity vehicle, Vec3 finalTarget, VehicleShape shape) {
-        if (vehicle.getPersistentData().getBoolean(PATH_ASYNC_PENDING)) return null;
+        if (vehicle.getPersistentData().getBoolean(PATH_ASYNC_PENDING)) {
+            // Route snapshots intentionally take several ticks.  Returning null here
+            // makes move() call stopVehicle(), so a tracked vehicle near an open
+            // house passage receives one steering tick and then waits for the whole
+            // async search.  It has native physical collision and can pivot in place;
+            // keep it making a short, bounded advance toward the safe target while
+            // the conservative grid search finishes in the background.
+            Vec3 trackedAdvance = trackedAsyncProgressTarget(vehicle, finalTarget, shape);
+            if (trackedAdvance != null) return trackedAdvance;
+            return null;
+        }
         double speed = horizontalSpeed(vehicle);
         if (flatDistance(vehicle.position(), finalTarget) <= directFinalRange(shape)
                 && canTravelDirect(vehicle, vehicle.position(), finalTarget, shape, directFinalRange(shape))) {
@@ -1533,6 +1543,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
         double lookahead = dynamicLookahead(speed, shape);
         return clippedTarget(vehicle.position(), finalTarget, lookahead);
+    }
+
+    private static Vec3 trackedAsyncProgressTarget(Entity vehicle, Vec3 finalTarget, VehicleShape shape) {
+        if (!isTrackedVehicle(vehicle) || finalTarget == null) return null;
+        double distance = flatDistance(vehicle.position(), finalTarget);
+        if (distance < 1.0E-6D) return null;
+        // Keep the temporary target close: normal tracked steering remains gentle,
+        // while a large close angle still uses the existing pivot-first branch.
+        double advance = Mth.clamp(shape.radius() * 2.0D, 6.0D, 10.0D);
+        return clippedTarget(vehicle.position(), finalTarget, advance);
     }
 
     private static boolean startAsyncRoute(Entity vehicle, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation) {

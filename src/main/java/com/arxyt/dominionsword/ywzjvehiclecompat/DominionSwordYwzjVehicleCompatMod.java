@@ -24,8 +24,10 @@ public final class DominionSwordYwzjVehicleCompatMod {
 
     private void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase == TickEvent.Phase.START) {
-            // WheeledVehicle turns input into force during its own physical tick.
-            vehicleAdapter.tickWheeledControl(event.getServer());
+            // Ground vehicles consume input during their own physical tick.  The
+            // planner runs at a lower frequency, so replay the latest autonomous
+            // command before that physics step.
+            vehicleAdapter.tickGroundControl(event.getServer());
         } else {
             vehicleAdapter.tickHelicopterAutopilot(event.getServer());
         }

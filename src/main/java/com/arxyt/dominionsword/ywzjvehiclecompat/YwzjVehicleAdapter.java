@@ -83,9 +83,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String HELI_COMBAT_TARGET = "DominionSwordYwzjHeliCombatTarget";
     /** Active persistent flight tasks only; never retain loaded Entity instances. */
     private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_HELICOPTERS = new ConcurrentHashMap<>();
-    /** Last autonomous command for a wheeled chassis, replayed before its native physics tick. */
-    private static final Map<ResourceKey<Level>, Map<UUID, WheeledControlState>> ACTIVE_WHEELED_CONTROLS = new ConcurrentHashMap<>();
-    private static final Map<UUID, Long> WHEELED_CONTROL_TRACE_TICKS = new ConcurrentHashMap<>();
+    /** Last autonomous command for a ground chassis, replayed before its native physics tick. */
+    private static final Map<ResourceKey<Level>, Map<UUID, GroundControlState>> ACTIVE_GROUND_CONTROLS = new ConcurrentHashMap<>();
+    private static final Map<UUID, Long> GROUND_CONTROL_TRACE_TICKS = new ConcurrentHashMap<>();
     private static final double HELI_CLOSE_TRANSLATE_RANGE = 30.0D;
     private static final double HELI_MAX_HORIZONTAL_SPEED = 0.72D;
     private static final double HELI_POSITION_TO_SPEED_GAIN = 0.055D;
@@ -716,24 +716,24 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     /**
-     * The native wheeled implementation applies engine force only while its control
-     * flags are set in that exact entity tick. Dominion's route planner deliberately
-     * runs less often, so replay the latest command just before entity physics.
+     * Native wheeled and tracked implementations consume their control flags in
+     * their exact physics tick. Dominion's route planner deliberately runs less
+     * often, so replay the latest command for every autonomous ground chassis.
      */
-    public void tickWheeledControl(net.minecraft.server.MinecraftServer server) {
+    public void tickGroundControl(net.minecraft.server.MinecraftServer server) {
         if (server == null) return;
-        ACTIVE_WHEELED_CONTROLS.entrySet().removeIf(entry -> {
+        ACTIVE_GROUND_CONTROLS.entrySet().removeIf(entry -> {
             ServerLevel level = server.getLevel(entry.getKey());
             if (level == null) return true;
-            Map<UUID, WheeledControlState> controls = entry.getValue();
+            Map<UUID, GroundControlState> controls = entry.getValue();
             controls.entrySet().removeIf(controlEntry -> {
                 Entity vehicle = level.getEntity(controlEntry.getKey());
-                if (!(vehicle instanceof WheeledVehicle wheeled) || !vehicle.isAlive()) return true;
+                if (!(vehicle instanceof AbstractVehicle ywzjVehicle) || !isPersistentGroundChassis(vehicle) || !vehicle.isAlive()) return true;
                 // Never synthesize input for a player-operated vehicle.
                 if (!(driver(vehicle) instanceof Mob)) return true;
-                WheeledControlState control = controlEntry.getValue();
-                writeControl(wheeled, control.forward(), control.backward(), control.right(), control.left(), control.brake());
-                traceWheeledControl(vehicle, wheeled, control);
+                GroundControlState control = controlEntry.getValue();
+                writeControl(ywzjVehicle, control.forward(), control.backward(), control.right(), control.left(), control.brake());
+                traceGroundControl(vehicle, ywzjVehicle, control);
                 return false;
             });
             return controls.isEmpty();
@@ -750,7 +750,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     public void onEntityUnloaded(Entity entity) {
         Entity vehicle = isRotaryWingVehicle(entity) ? entity : entity instanceof Mob mob ? mob.getVehicle() : null;
         if (vehicle != null) unregisterActiveHelicopter(vehicle);
-        if (entity instanceof WheeledVehicle) unregisterActiveWheeledControl(entity);
+        unregisterActiveGroundControl(entity);
     }
 
     private static boolean moveHelicopter(Entity vehicle, Vec3 target) {
@@ -1106,21 +1106,25 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
     }
 
-    private static void registerActiveWheeledControl(Entity vehicle, boolean forward, boolean backward,
-                                                     boolean right, boolean left, boolean brake) {
-        if (!(vehicle instanceof WheeledVehicle) || vehicle.level().isClientSide()) return;
-        ACTIVE_WHEELED_CONTROLS.computeIfAbsent(vehicle.level().dimension(), ignored -> new ConcurrentHashMap<>())
-                .put(vehicle.getUUID(), new WheeledControlState(forward, backward, right, left, brake));
+    private static boolean isPersistentGroundChassis(Entity vehicle) {
+        return vehicle instanceof WheeledVehicle || isTrackedVehicle(vehicle);
     }
 
-    private static void unregisterActiveWheeledControl(Entity vehicle) {
+    private static void registerActiveGroundControl(Entity vehicle, boolean forward, boolean backward,
+                                                    boolean right, boolean left, boolean brake) {
+        if (!isPersistentGroundChassis(vehicle) || vehicle.level().isClientSide()) return;
+        ACTIVE_GROUND_CONTROLS.computeIfAbsent(vehicle.level().dimension(), ignored -> new ConcurrentHashMap<>())
+                .put(vehicle.getUUID(), new GroundControlState(forward, backward, right, left, brake));
+    }
+
+    private static void unregisterActiveGroundControl(Entity vehicle) {
         if (vehicle == null) return;
-        Map<UUID, WheeledControlState> entries = ACTIVE_WHEELED_CONTROLS.get(vehicle.level().dimension());
+        Map<UUID, GroundControlState> entries = ACTIVE_GROUND_CONTROLS.get(vehicle.level().dimension());
         if (entries != null) {
             entries.remove(vehicle.getUUID());
-            if (entries.isEmpty()) ACTIVE_WHEELED_CONTROLS.remove(vehicle.level().dimension(), entries);
+            if (entries.isEmpty()) ACTIVE_GROUND_CONTROLS.remove(vehicle.level().dimension(), entries);
         }
-        WHEELED_CONTROL_TRACE_TICKS.remove(vehicle.getUUID());
+        GROUND_CONTROL_TRACE_TICKS.remove(vehicle.getUUID());
     }
 
     private static Vec3 helicopterTaskTarget(Mob mob, Entity vehicle) {
@@ -1883,7 +1887,6 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         // could not actually drive through.  Keep its proven pre-1.2.49 behavior.
         if (!isTrackedVehicle(vehicle)) return canOccupyStrictVehicleSpace(level, vehicle, position, shape);
 
-        int radius = Math.max(1, (int) Math.ceil(shape.radius()));
         int height = Math.max(2, shape.voxelHeight());
         BlockPos center = BlockPos.containing(position.x, position.y + shape.voxelYOffset(), position.z);
         // A vehicle's native physics follows its suspension and can span a natural
@@ -1897,11 +1900,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             BlockPos pos = center.above(dy);
             if (!level.getBlockState(pos).getCollisionShape(level, pos).isEmpty()) return false;
         }
-        double[][] terrain = new double[radius * 2 + 1][radius * 2 + 1];
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                terrain[dx + radius][dz + radius] = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-                        center.getX() + dx, center.getZ() + dz);
+        // Use the current physical OBB's world-space envelope, not a square made
+        // from its longest edge.  A tracked chassis can pivot before entering a
+        // turn, so its route probe may keep the current real footprint.
+        AABB footprint = shape.aabbAt(position);
+        int minX = Mth.floor(footprint.minX + 1.0E-4D);
+        int maxX = Mth.floor(footprint.maxX - 1.0E-4D);
+        int minZ = Mth.floor(footprint.minZ + 1.0E-4D);
+        int maxZ = Mth.floor(footprint.maxZ - 1.0E-4D);
+        double[][] terrain = new double[Math.max(1, maxX - minX + 1)][Math.max(1, maxZ - minZ + 1)];
+        for (int x = 0; x < terrain.length; x++) {
+            for (int z = 0; z < terrain[x].length; z++) {
+                terrain[x][z] = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                        minX + x, minZ + z);
             }
         }
         return terrainFootprintProfileAllowed(terrain);
@@ -2677,7 +2688,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static void applyControl(Entity vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
         if (!(vehicle instanceof AbstractVehicle ywzjVehicle)) return;
         writeControl(ywzjVehicle, forward, backward, right, left, brake);
-        registerActiveWheeledControl(vehicle, forward, backward, right, left, brake);
+        registerActiveGroundControl(vehicle, forward, backward, right, left, brake);
         alignMainWeaponsForward(vehicle, forward);
     }
 
@@ -2699,14 +2710,15 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         control.yRotKeep = false;
     }
 
-    private static void traceWheeledControl(Entity vehicle, WheeledVehicle wheeled, WheeledControlState control) {
+    private static void traceGroundControl(Entity vehicle, AbstractVehicle chassis, GroundControlState control) {
         long now = vehicle.level().getGameTime();
-        Long previous = WHEELED_CONTROL_TRACE_TICKS.get(vehicle.getUUID());
+        Long previous = GROUND_CONTROL_TRACE_TICKS.get(vehicle.getUUID());
         if (previous != null && now - previous < 20L) return;
-        WHEELED_CONTROL_TRACE_TICKS.put(vehicle.getUUID(), now);
-        pathDebug(vehicle, "WHEELED_TICK_CONTROL", "forward=%s backward=%s right=%s left=%s brake=%s power=%.1f engine=%s",
+        GROUND_CONTROL_TRACE_TICKS.put(vehicle.getUUID(), now);
+        pathDebug(vehicle, "GROUND_TICK_CONTROL", "tracked=%s forward=%s backward=%s right=%s left=%s brake=%s power=%.1f engine=%s",
+                isTrackedVehicle(vehicle),
                 control.forward(), control.backward(), control.right(), control.left(), control.brake(),
-                wheeled.getPower(), wheeled.isEngineOn());
+                chassis.getPower(), chassis.isEngineOn());
     }
 
     private static void alignMainWeaponsForward(Entity vehicle, boolean moving) {
@@ -2728,12 +2740,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void stopVehicle(Entity vehicle) {
-        unregisterActiveWheeledControl(vehicle);
+        unregisterActiveGroundControl(vehicle);
         clearTrackedEscapePivot(vehicle.getPersistentData());
         if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
     }
 
-    private record WheeledControlState(boolean forward, boolean backward, boolean right, boolean left, boolean brake) {}
+    private record GroundControlState(boolean forward, boolean backward, boolean right, boolean left, boolean brake) {}
 
     private static void pathDebug(Entity vehicle, String phase, String format, Object... args) {
         try {
@@ -3057,7 +3069,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void traceRouteShape(Entity vehicle, VehicleShape shape) {
         AABB entityBox = vehicle.getBoundingBox();
-        pathDebug(vehicle, "SHAPE", "wheeled=%s entity=%s mainObb=%s allObb=%s routeBox=%s radius=%.2f exactNativeBox=%s",
+        pathDebug(vehicle, "SHAPE", "wheeled=%s entity=%s physicsObb=%s allObb=%s routeBox=%s radius=%.2f exactNativeBox=%s",
                 !isTrackedVehicle(vehicle), boxSize(entityBox), boxSize(mainObbAabb(vehicle)), boxSize(allObbAabb(vehicle)),
                 boxSize(shape.aabbAt(vehicle.position())), shape.radius(), shape.exactNativeBox());
     }
@@ -3209,19 +3221,20 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         static VehicleShape from(Entity vehicle) {
             AABB entityBox = vehicle.getBoundingBox();
             boolean wheeled = !isTrackedVehicle(vehicle);
-            // getOBBs contains turrets, guns and decorations. Those are valid selection
-            // components but are not a road-width collision hull for a wheeled vehicle.
-            AABB obb = wheeled ? null : allObbAabb(vehicle);
-            AABB box = obb == null ? entityBox : union(obb, entityBox);
+            // TrackedVehicle's block physics uses getMainCubeOBB(), not its complete
+            // selection/decorative OBB list.  The latter includes the turret, gun and
+            // accessories and inflated a narrow road probe into a large square.
+            AABB physicsObb = wheeled ? null : mainObbAabb(vehicle);
+            AABB box = physicsObb == null ? entityBox : physicsObb;
             double radius = wheeled
                     ? Math.max(1.0D, Math.min(box.getXsize(), box.getZsize()) * 0.5D + 0.10D)
-                    : Math.max(1.5D, Math.max(box.getXsize(), box.getZsize()) * 0.5D + 1.0D);
+                    : Math.max(1.5D, Math.max(box.getXsize(), box.getZsize()) * 0.5D);
             double minYOffset = Math.min(-0.1D, box.minY - vehicle.getY());
             double maxYOffset = Math.max(1.2D, box.maxY - vehicle.getY() + 0.25D);
             double voxelYOffset = Math.max(0.0D, minYOffset + 0.18D);
             int voxelHeight = Math.max(2, Mth.ceil(maxYOffset - voxelYOffset + 0.15D));
             return new VehicleShape(radius, minYOffset, maxYOffset, voxelYOffset, voxelHeight,
-                    wheeled ? entityBox : null, vehicle.position(), wheeled);
+                    box, vehicle.position(), true);
         }
 
         AABB aabbAt(Vec3 position) {

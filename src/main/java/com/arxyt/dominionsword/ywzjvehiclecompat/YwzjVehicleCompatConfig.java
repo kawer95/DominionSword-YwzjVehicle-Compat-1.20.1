@@ -6,6 +6,7 @@ public final class YwzjVehicleCompatConfig {
     public static final ForgeConfigSpec SPEC;
     public static final ForgeConfigSpec.BooleanValue LAG_TRACE_ENABLED;
     public static final ForgeConfigSpec.DoubleValue LAG_TRACE_WARN_MS;
+    public static final ForgeConfigSpec.BooleanValue PATH_TRACE_VERBOSE;
     public static final ForgeConfigSpec.BooleanValue FLIGHT_CONTROL_TRACE_ENABLED;
     public static final ForgeConfigSpec.IntValue FLIGHT_CONTROL_TRACE_INTERVAL_TICKS;
     public static final ForgeConfigSpec.BooleanValue MULTI_STAGE_K_TURN_ENABLED;
@@ -19,6 +20,9 @@ public final class YwzjVehicleCompatConfig {
         LAG_TRACE_WARN_MS = builder
                 .comment("Warn when a traced YWZJ vehicle-control section takes at least this many milliseconds.")
                 .defineInRange("lagTraceWarnMs", 8.0D, 0.1D, 10_000.0D);
+        PATH_TRACE_VERBOSE = builder
+                .comment("Log every pose/node/OBB sample during ground pathfinding. Extremely expensive; keep false except for a short diagnostic capture.")
+                .define("pathTraceVerbose", false);
         FLIGHT_CONTROL_TRACE_ENABLED = builder
                 .comment("Log complete rotary-wing flight-control state for diagnosis. Enabled temporarily by default.")
                 .define("flightControlTrace", true);
@@ -42,6 +46,10 @@ public final class YwzjVehicleCompatConfig {
 
     public static double lagTraceWarnMs() {
         return LAG_TRACE_WARN_MS.get();
+    }
+
+    public static boolean pathTraceVerbose() {
+        return PATH_TRACE_VERBOSE.get();
     }
 
     public static boolean flightControlTraceEnabled() {

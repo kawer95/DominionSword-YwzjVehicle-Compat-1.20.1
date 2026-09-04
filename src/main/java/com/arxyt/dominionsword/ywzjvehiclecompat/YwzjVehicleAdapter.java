@@ -55,7 +55,11 @@ import org.ywzj.vehicle.entity.vehicle.WheeledVehicle;
 import org.ywzj.vehicle.vehicle.control.ControlUnit;
 import org.ywzj.vehicle.vehicle.part.WeaponUnit;
 import org.ywzj.vehicle.vehicle.pojo.AimContext;
+import org.ywzj.vehicle.vehicle.structure.OBB;
+import org.ywzj.vehicle.vehicle.structure.VehicleCubeOBB;
 import org.ywzj.vehicle.vehicle.weapon.AbstractVehicleWeapon;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
 
 /** Reflective bridge for Limitless Vehicle / ywzj_vehicle. */
 public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
@@ -190,9 +194,57 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final Map<MethodKey, Optional<Method>> METHOD_CACHE = new ConcurrentHashMap<>();
     private static final Set<MethodKey> BROKEN_METHODS = ConcurrentHashMap.newKeySet();
     private static final Map<UUID, AsyncRouteBuild> ASYNC_ROUTES = new ConcurrentHashMap<>();
+    /**
+     * A tracked hull cannot be planned as an un-orientated point.  These searches run on the
+     * server thread in small slices because each candidate uses the same main-OBB surface
+     * samples as YWZJ's native physics; putting live Level access on an async worker is unsafe.
+     */
+    private static final Map<UUID, TrackedPoseRouteBuild> TRACKED_POSE_BUILDS = new ConcurrentHashMap<>();
+    private static final Map<UUID, TrackedPoseRoute> TRACKED_POSE_ROUTES = new ConcurrentHashMap<>();
+    private static final Map<UUID, TrackedRecovery> TRACKED_RECOVERIES = new ConcurrentHashMap<>();
+    private static final Map<UUID, TrackedMotionWatch> TRACKED_MOTION_WATCHES = new ConcurrentHashMap<>();
+    /**
+     * The yaw-only navigation hull can disagree with a physically pitched chassis while that
+     * chassis bridges a ditch or stair edge.  During this short window native physics remains
+     * the authority instead of leaving a driveable tank on neutral controls.
+     */
+    private static final Map<UUID, Long> TRACKED_PROXY_DRIVE_UNTIL = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> HELICOPTER_SELECTION_TRACE_TICKS = new ConcurrentHashMap<>();
     private static final int ASYNC_SNAPSHOT_CELLS_PER_TICK = 72;
     private static final String PATH_ASYNC_PENDING = "DominionSwordYwzjPathAsyncPending";
+    private static final double TRACKED_POSE_CELL = 0.5D;
+    private static final double TRACKED_POSE_FORWARD_STEP = 1.0D;
+    /** A chassis rotation is a stop-and-pivot manoeuvre, not 0.3 blocks of free travel. */
+    private static final double TRACKED_POSE_ROTATION_COST = 2.75D;
+    /** Keep A* target-directed without making the first zig-zag goal state dominate route quality. */
+    private static final double TRACKED_POSE_HEURISTIC_WEIGHT = 1.10D;
+    // A 30 degree heading lattice is enough for the tank's pivot steering, but avoids
+    // spending half of a route search on nearly-identical 15 degree poses.
+    private static final int TRACKED_POSE_HEADINGS = 12;
+    private static final int TRACKED_POSE_EXPANSIONS_PER_TICK = 24;
+    /** Receding-horizon planner: never hold a driveable tank still for a long global search. */
+    private static final int TRACKED_POSE_PARTIAL_ROUTE_TICKS = 20;
+    private static final double TRACKED_POSE_PARTIAL_MIN_PROGRESS = 0.75D;
+    /** Moving formation targets may drift while an incremental search is running. */
+    private static final double TRACKED_POSE_TARGET_REUSE_RADIUS = 8.0D;
+    /** Hard server-thread slice per vehicle.  Node count alone cannot bound OBB work. */
+    private static final long TRACKED_POSE_SEARCH_BUDGET_NANOS = 2_000_000L;
+    /** Route string-pulling runs synchronously after A* and therefore needs its own ceiling. */
+    private static final long TRACKED_POSE_SIMPLIFY_BUDGET_NANOS = 2_000_000L;
+    private static final int TRACKED_POSE_MAX_EXPANSIONS = 10000;
+    private static final double TRACKED_POSE_MAX_RANGE = 48.0D;
+    private static final double TRACKED_POSE_GOAL_RADIUS = 1.10D;
+    private static final double TRACKED_POSE_REACH_RADIUS = 0.36D;
+    private static final double TRACKED_POSE_YAW_TOLERANCE = 4.0D;
+    private static final double TRACKED_POSE_DIRECT_REVERSE_RANGE = 15.0D;
+    /** Translation nodes steer into modest corrections; only real turns stop and pivot. */
+    private static final double TRACKED_POSE_ROLLING_STEER_MAX_YAW = 30.0D;
+    // trackedBrakeControl releases at 0.025 to avoid flipping into reverse.  Pivot only at
+    // that same near-zero threshold; the previous 0.045 still produced visible forward drift.
+    private static final double TRACKED_POSE_PIVOT_SPEED = 0.026D;
+    private static final double TRACKED_NATIVE_BRAKE_PER_TICK = 0.025D;
+    private static final double TRACKED_RECOVERY_DISTANCE = 1.75D;
+    private static final int TRACKED_RECOVERY_MAX_TICKS = 90;
 
     @Override
     public int priority() {
@@ -485,6 +537,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             LagTrace.mark("shape");
             ensureRoute(player, vehicle, target, shape);
             LagTrace.mark("ensure_route");
+            // Never feed a tracked chassis back into the old point/AABB route follower.
+            // Its route states carry the hull heading, so a node means "turn here, then
+            // advance" rather than merely "put the entity centre here".
+            if (isTrackedVehicle(vehicle)) {
+                return moveTrackedPoseRoute(player, vehicle, target, activeSafeTarget(vehicle, target), shape);
+            }
             Vec3 safeTarget = activeSafeTarget(vehicle, target);
             if (hasCapturedFinalTarget(vehicle, safeTarget, shape)) {
                 stopVehicle(vehicle);
@@ -509,6 +567,24 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             float yawDiff = Mth.wrapDegrees(desiredYaw - vehicle.getYRot());
             double absYaw = Math.abs(yawDiff);
             double speed = horizontalSpeed(vehicle);
+            if (vehicle.getPersistentData().getBoolean(PATH_ASYNC_PENDING) && isTrackedVehicle(vehicle)) {
+                // Keep the hull at the snapshot origin while the coarse route grid is built.
+                // Letting it drive its 6-10 block "temporary" target changed the vehicle's
+                // position underneath the pending snapshot.  When the result arrived, its first
+                // waypoint could be behind the tank, producing an inexplicable 180-degree turn
+                // into the house it had just passed.  Tracked vehicles can use that time to
+                // rotate in place toward the destination instead, then start from the exact
+                // position the collision grid actually evaluated.
+                boolean turn = absYaw > 3.0D;
+                boolean steerRight = turn && yawDiff > 0.0F;
+                boolean steerLeft = turn && yawDiff < 0.0F;
+                applyControl(vehicle, false, false, steerRight, steerLeft, !turn);
+                pathDebug(vehicle, turn ? "ASYNC_TRACK_PIVOT" : "ASYNC_TRACK_HOLD",
+                        "target=%s safe=%s yawDiff=%.1f absYaw=%.1f keys=%d",
+                        fmt(driveTarget), fmt(safeTarget), yawDiff, absYaw,
+                        (int) packControl(false, false, steerRight, steerLeft, !turn));
+                return true;
+            }
             boolean finalTarget = flatDistance(driveTarget, safeTarget) <= 1.25D;
             double captureDistance = finalCaptureDistance(shape, speed);
             if (finalTarget && shouldHardBrakeNearFinal(vehicle, safeTarget, distance, speed, captureDistance)) {
@@ -732,7 +808,34 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 // Never synthesize input for a player-operated vehicle.
                 if (!(driver(vehicle) instanceof Mob)) return true;
                 GroundControlState control = controlEntry.getValue();
+                boolean alignedTrackedWeapons = false;
+                if (isTrackedVehicle(vehicle)) {
+                    // A Dominion move callback is intentionally sparse.  Re-evaluate the
+                    // current short pose node here, at the same 20 Hz that native tracked
+                    // physics consumes the keys.  This is what prevents a 0.5 block/tick
+                    // tank from crossing a waypoint (or the final target) between callbacks.
+                    TrackedPoseRouteBuild build = TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+                    if (build != null) advanceTrackedPoseRoute(null, vehicle, build);
+                    TrackedPoseRoute route = TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+                    TrackedRecovery recovery = TRACKED_RECOVERIES.get(vehicle.getUUID());
+                    if (recovery == null && isTrackedPhysicallyStuck(vehicle)) {
+                        recovery = beginTrackedRecovery(vehicle, route == null ? trackedStoredTarget(vehicle) : route.target);
+                    }
+                    control = recovery != null
+                            ? trackedRecoveryControl(vehicle, recovery)
+                            : route == null && trackedProxyDriveActive(vehicle)
+                            ? trackedProxyConflictControl(vehicle, trackedStoredTarget(vehicle))
+                            : route == null ? trackedBrakeControl(vehicle) : trackedPoseControl(vehicle, route);
+                    controls.put(vehicle.getUUID(), control);
+                    traceTrackedPoseTick(vehicle, ywzjVehicle, route, recovery, control);
+                    watchTrackedMotion(vehicle, ywzjVehicle, route, recovery, control);
+                    if (route != null || build != null) {
+                        alignMainWeaponsToYaw(vehicle, trackedWeaponAimYaw(vehicle, route, build, null), true);
+                        alignedTrackedWeapons = true;
+                    }
+                }
                 writeControl(ywzjVehicle, control.forward(), control.backward(), control.right(), control.left(), control.brake());
+                if (!alignedTrackedWeapons) alignMainWeaponsForward(vehicle, control.forward());
                 traceGroundControl(vehicle, ywzjVehicle, control);
                 return false;
             });
@@ -1144,6 +1247,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void ensureRoute(ServerPlayer player, Entity vehicle, Vec3 target, VehicleShape shape) {
         CompoundTag data = vehicle.getPersistentData();
+        if (isTrackedVehicle(vehicle)) {
+            ensureTrackedPoseRoute(player, vehicle, target, shape);
+            return;
+        }
         if (data.getBoolean(PATH_ASYNC_PENDING)) {
             advanceAsyncRoute(player, vehicle, target, Set.of(vehicle.getUUID()));
             return;
@@ -1443,6 +1550,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static void prepareRoute(ServerPlayer player, Entity vehicle, Vec3 target, Set<UUID> ignoredVehicles) {
         try (LagTrace ignoredTrace = LagTrace.start("ywzj.route.prepare", "vehicle=" + (vehicle == null ? "null" : vehicle.getId()))) {
         if (vehicle == null || target == null || !isInstance(vehicle, VEHICLE_CLASS_NAME)) return;
+        if (isTrackedVehicle(vehicle)) {
+            prepareTrackedPoseRoute(player, vehicle, target, ignoredVehicles);
+            return;
+        }
         CompoundTag data = vehicle.getPersistentData();
         if (data.getBoolean(PATH_ASYNC_PENDING)) {
             advanceAsyncRoute(player, vehicle, target, ignoredVehicles);
@@ -1501,14 +1612,1244 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
     }
 
+    /**
+     * Tracked vehicles are planned in configuration space: position plus hull heading.
+     * The former grid planner only knew the centre position, so it could select a gap that
+     * was reachable on paper but could not be entered, turned through, or exited by the tank.
+     */
+    private static void ensureTrackedPoseRoute(ServerPlayer player, Entity vehicle, Vec3 target, VehicleShape shape) {
+        if (TRACKED_RECOVERIES.containsKey(vehicle.getUUID())) return;
+        TrackedPoseRoute route = TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+        if (route != null && route.matches(target)) return;
+        TrackedPoseRouteBuild build = TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+        if (build != null && build.matches(target)) {
+            build.commandTarget = target;
+            advanceTrackedPoseRoute(player, vehicle, build);
+            return;
+        }
+        // A failed search must remain failed until its cooldown expires.  Previously the
+        // missing route caused every command callback to create another fresh 3,600-node
+        // search, so a blocked tank did expensive work repeatedly without ever progressing.
+        if (trackedPoseReplanCoolingDown(vehicle, target)) return;
+        prepareTrackedPoseRoute(player, vehicle, target, Set.of(vehicle.getUUID()));
+    }
+
+    private static void prepareTrackedPoseRoute(ServerPlayer player, Entity vehicle, Vec3 target, Set<UUID> ignoredVehicles) {
+        if (!(vehicle instanceof AbstractVehicle chassis) || target == null) return;
+        if (TRACKED_RECOVERIES.containsKey(vehicle.getUUID())) return;
+        TrackedPoseRoute active = TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+        if (active != null && active.matches(target)) return;
+        TrackedPoseRouteBuild existing = TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+        if (existing != null && existing.matches(target)) {
+            existing.commandTarget = target;
+            advanceTrackedPoseRoute(player, vehicle, existing);
+            return;
+        }
+        // prepareFleetMoveRoutes() may call this method every server tick.  Respect the same
+        // failure cooldown here as in ensureTrackedPoseRoute(), otherwise an unsolved route
+        // is destroyed and rebuilt before the incremental search can make a second step.
+        if (trackedPoseReplanCoolingDown(vehicle, target)) return;
+
+        CompoundTag data = vehicle.getPersistentData();
+        ASYNC_ROUTES.remove(vehicle.getUUID());
+        data.remove(PATH_ASYNC_PENDING);
+        TRACKED_POSE_ROUTES.remove(vehicle.getUUID());
+        TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+
+        VehicleShape shape = VehicleShape.from(vehicle);
+        TrackedHull hull = TrackedHull.from(chassis);
+        if (hull == null) {
+            data.putBoolean(PATH_BLOCKED, true);
+            data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 40L);
+            pathDebug(vehicle, "POSE_ROUTE_BLOCKED", "reason=missing_main_obb target=%s", fmt(target));
+            return;
+        }
+        pathDebug(vehicle, "POSE_HULL", "groundOffset=%.3f lowSideY=%.3f samples=%d entityY=%.3f mainObb=%s",
+                hull.entityGroundOffset, hull.lowSideContactY, hull.samples.size(), vehicle.getY(), boxBounds(mainObbAabb(vehicle)));
+        pathDebug(vehicle, "POSE_NAV_FRAME", "mode=2.5d_yaw_only physicalPitch=%.2f physicalRoll=%.2f",
+                vehicle.getXRot(), chassis.getZRot());
+        long generation = data.getLong(PATH_GENERATION) + 1L;
+        data.putLong(PATH_GENERATION, generation);
+        data.putDouble(FINAL_TARGET_X, target.x);
+        data.putDouble(FINAL_TARGET_Z, target.z);
+        data.putDouble(SAFE_TARGET_X, target.x);
+        data.putDouble(SAFE_TARGET_Y, target.y);
+        data.putDouble(SAFE_TARGET_Z, target.z);
+        data.remove(PATH_BLOCKED);
+
+        List<TrackedPose> direct = directTrackedPoseRoute(vehicle, target, hull, ignoredVehicles);
+        if (direct != null) {
+            installTrackedPoseRoute(player, vehicle, target, direct.get(direct.size() - 1).position(), generation, hull, direct);
+            pathDebug(vehicle, "POSE_ROUTE_DIRECT", "target=%s steps=%d", fmt(target), direct.size());
+            return;
+        }
+
+        double distance = flatDistance(vehicle.position(), target);
+        double range = Mth.clamp(Math.max(28.0D, distance + shape.radius() * 4.0D), 28.0D, PATH_SEARCH_RADIUS);
+        TrackedPoseRouteBuild build = new TrackedPoseRouteBuild(vehicle.position(), vehicle.getYRot(), target, hull,
+                ignoredVehicles == null ? Set.of() : Set.copyOf(ignoredVehicles), generation, range,
+                vehicle.level().getGameTime());
+        TRACKED_POSE_BUILDS.put(vehicle.getUUID(), build);
+        data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + PATH_REPLAN_COOLDOWN_TICKS);
+        pathDebug(vehicle, "POSE_ROUTE_START", "target=%s range=%.1f headings=%d", fmt(target), range, TRACKED_POSE_HEADINGS);
+        advanceTrackedPoseRoute(player, vehicle, build);
+    }
+
+    private static boolean trackedPoseReplanCoolingDown(Entity vehicle, Vec3 target) {
+        if (vehicle == null || target == null) return false;
+        CompoundTag data = vehicle.getPersistentData();
+        if (!data.getBoolean(PATH_BLOCKED) || !data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)) return false;
+        Vec3 failedTarget = new Vec3(data.getDouble(FINAL_TARGET_X), target.y, data.getDouble(FINAL_TARGET_Z));
+        return flatDistanceSqr(target, failedTarget) <= 4.0D
+                && vehicle.level().getGameTime() < data.getLong(REPLAN_AFTER);
+    }
+
+    private static List<TrackedPose> directTrackedPoseRoute(Entity vehicle, Vec3 target, TrackedHull hull, Set<UUID> ignoredVehicles) {
+        Vec3 start = vehicle.position();
+        Vec3 horizontal = target.subtract(start).multiply(1.0D, 0.0D, 1.0D);
+        if (horizontal.lengthSqr() < 1.0E-6D) return List.of(new TrackedPose(start, vehicle.getYRot(), false));
+        float yaw = yawTo(horizontal);
+        if (trackedShouldDirectShortReverse(vehicle.getYRot(), yaw, horizontal.length())) {
+            float reverseYaw = Mth.wrapDegrees(yaw + 180.0F);
+            List<TrackedPose> route = new ArrayList<>();
+            route.add(new TrackedPose(start, vehicle.getYRot(), true));
+            int segments = Math.max(1, Mth.ceil(horizontal.length() / TRACKED_POSE_FORWARD_STEP));
+            Vec3 previous = start;
+            for (int i = 1; i <= segments; i++) {
+                double fraction = (double) i / segments;
+                Vec3 raw = new Vec3(Mth.lerp(fraction, start.x, target.x), previous.y,
+                        Mth.lerp(fraction, start.z, target.z));
+                Vec3 next = resolveTrackedPosePosition(vehicle, raw, reverseYaw, hull, ignoredVehicles, previous.y);
+                if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
+                route.add(new TrackedPose(next, reverseYaw, true));
+                previous = next;
+            }
+            pathDebug(vehicle, "POSE_ROUTE_SHORT_REVERSE", "target=%s distance=%.2f bodyYaw=%.1f reverseYaw=%.1f steps=%d",
+                    fmt(target), horizontal.length(), vehicle.getYRot(), reverseYaw, route.size());
+            return route;
+        }
+        if (!canTrackedPosePivot(vehicle, start, vehicle.getYRot(), yaw, hull, ignoredVehicles)) return null;
+        List<TrackedPose> route = new ArrayList<>();
+        route.add(new TrackedPose(start, vehicle.getYRot(), false));
+        if (Math.abs(Mth.wrapDegrees(yaw - vehicle.getYRot())) > TRACKED_POSE_YAW_TOLERANCE) route.add(new TrackedPose(start, yaw, false));
+        // Do not represent a 40-block clear road as a single control target.  The native
+        // tracked chassis can cover half a block per physics tick; command callbacks are much
+        // sparser, so a single endpoint guaranteed that it would overshoot the destination.
+        int segments = Math.max(1, Mth.ceil(horizontal.length() / TRACKED_POSE_FORWARD_STEP));
+        Vec3 previous = start;
+        for (int i = 1; i <= segments; i++) {
+            double fraction = (double) i / segments;
+            Vec3 raw = new Vec3(Mth.lerp(fraction, start.x, target.x), previous.y, Mth.lerp(fraction, start.z, target.z));
+            Vec3 next = resolveTrackedPosePosition(vehicle, raw, yaw, hull, ignoredVehicles, previous.y);
+            if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
+            route.add(new TrackedPose(next, yaw, false));
+            previous = next;
+        }
+        return route;
+    }
+
+    static boolean trackedShouldDirectShortReverse(float currentYaw, float targetYaw, double distance) {
+        return distance < TRACKED_POSE_DIRECT_REVERSE_RANGE
+                && Math.abs(Mth.wrapDegrees(targetYaw - currentYaw)) >= REVERSE_ANGLE;
+    }
+
+    private static void advanceTrackedPoseRoute(ServerPlayer player, Entity vehicle, TrackedPoseRouteBuild build) {
+        CompoundTag data = vehicle.getPersistentData();
+        if (!build.matchesFinalTarget(data) || !(vehicle instanceof AbstractVehicle)) {
+            TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+            return;
+        }
+        long gameTick = vehicle.level().getGameTime();
+        // prepareRoute(), the command callback and tickGroundControl() may all reach here in
+        // one server tick.  A per-call budget would silently multiply under exactly the load
+        // that pathfinding is supposed to survive.
+        if (build.lastAdvanceTick == gameTick) return;
+        build.lastAdvanceTick = gameTick;
+        long sliceStart = System.nanoTime();
+        long deadline = sliceStart + TRACKED_POSE_SEARCH_BUDGET_NANOS;
+        int budget = TRACKED_POSE_EXPANSIONS_PER_TICK;
+        int expandedThisTick = 0;
+        while (budget-- > 0 && (expandedThisTick == 0 || System.nanoTime() < deadline)) {
+            TrackedPoseNode node = build.open.poll();
+            if (node == null) {
+                build.cpuNanos += System.nanoTime() - sliceStart;
+                failTrackedPoseRoute(vehicle, build, "exhausted");
+                return;
+            }
+            Double best = build.costs.get(node.key);
+            if (best == null || node.cost > best + 1.0E-6D) continue;
+            pathDebug(vehicle, "POSE_EXPAND", "generation=%d expanded=%d key=(%d,%d,%d) node=%s yaw=%.1f g=%.3f f=%.3f open=%d",
+                    build.generation, build.expanded, node.key.x, node.key.z, node.key.heading,
+                    fmt(node.position), trackedPoseYaw(node.key.heading), node.cost, node.priority, build.open.size());
+            if (flatDistance(node.position, build.target) <= TRACKED_POSE_GOAL_RADIUS) {
+                List<TrackedPose> rawRoute = reconstructTrackedPoseRoute(node, build.startYaw);
+                List<TrackedPose> route = simplifyTrackedPoseRoute(vehicle, rawRoute, build.hull, build.ignored);
+                build.cpuNanos += System.nanoTime() - sliceStart;
+                TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+                installTrackedPoseRoute(player, vehicle, build.commandTarget, node.position, build.generation, build.hull, route);
+                pathDebug(vehicle, "POSE_ROUTE_APPLIED", "generation=%d ticks=%d cpuMs=%.2f expanded=%d poseTests=%d cacheHits=%d obbFallbacks=%d terrainContacts=%d convexRejects=%d rejected=%d sweeps=%d rawSteps=%d simplifiedSteps=%d final=%s",
+                        build.generation, gameTick - build.startedTick + 1L, build.cpuNanos / 1_000_000.0D,
+                        build.expanded, build.poseTests, build.cacheHits, build.obbFallbacks,
+                        build.terrainContacts, build.convexRejects, build.rejectedPoses, build.sweeps,
+                        rawRoute.size(), route.size(), fmt(node.position));
+                return;
+            }
+            if (++build.expanded > TRACKED_POSE_MAX_EXPANSIONS) {
+                build.cpuNanos += System.nanoTime() - sliceStart;
+                failTrackedPoseRoute(vehicle, build, "budget");
+                return;
+            }
+            expandedThisTick++;
+            expandTrackedPoseNode(vehicle, build, node);
+        }
+        build.cpuNanos += System.nanoTime() - sliceStart;
+        if (gameTick - build.startedTick + 1L >= TRACKED_POSE_PARTIAL_ROUTE_TICKS
+                && build.bestNode != null
+                && build.bestNode.parent != null
+                && flatDistance(build.anchor, build.bestNode.position) >= TRACKED_POSE_PARTIAL_MIN_PROGRESS) {
+            List<TrackedPose> rawRoute = reconstructTrackedPoseRoute(build.bestNode, build.startYaw);
+            List<TrackedPose> route = simplifyTrackedPoseRoute(vehicle, rawRoute, build.hull, build.ignored);
+            TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+            installTrackedPoseRoute(player, vehicle, build.commandTarget, build.bestNode.position,
+                    build.generation, build.hull, route);
+            pathDebug(vehicle, "POSE_ROUTE_PARTIAL", "generation=%d ticks=%d cpuMs=%.2f expanded=%d rawSteps=%d simplifiedSteps=%d progress=%.2f remaining=%.2f",
+                    build.generation, gameTick - build.startedTick + 1L, build.cpuNanos / 1_000_000.0D,
+                    build.expanded, rawRoute.size(), route.size(), flatDistance(build.anchor, build.bestNode.position),
+                    flatDistance(build.bestNode.position, build.target));
+            return;
+        }
+        if (gameTick - build.lastProgressTick >= 20L) {
+            build.lastProgressTick = gameTick;
+            pathDebug(vehicle, "POSE_ROUTE_PROGRESS", "generation=%d ticks=%d sliceMs=%.2f cpuMs=%.2f tickExpanded=%d expanded=%d open=%d poseTests=%d cacheHits=%d obbFallbacks=%d terrainContacts=%d convexRejects=%d rejected=%d sweeps=%d",
+                    build.generation, gameTick - build.startedTick + 1L,
+                    (System.nanoTime() - sliceStart) / 1_000_000.0D, build.cpuNanos / 1_000_000.0D,
+                    expandedThisTick, build.expanded, build.open.size(), build.poseTests,
+                    build.cacheHits, build.obbFallbacks, build.terrainContacts, build.convexRejects,
+                    build.rejectedPoses, build.sweeps);
+        }
+    }
+
+    private static void expandTrackedPoseNode(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseNode node) {
+        int left = Math.floorMod(node.key.heading - 1, TRACKED_POSE_HEADINGS);
+        int right = Math.floorMod(node.key.heading + 1, TRACKED_POSE_HEADINGS);
+        addTrackedPoseRotation(vehicle, build, node, left);
+        addTrackedPoseRotation(vehicle, build, node, right);
+        addTrackedPoseTranslation(vehicle, build, node, false);
+        addTrackedPoseTranslation(vehicle, build, node, true);
+    }
+
+    private static void addTrackedPoseRotation(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseNode from, int heading) {
+        float yaw = trackedPoseYaw(heading);
+        if (!canTrackedPoseOccupy(vehicle, from.position, yaw, build.hull, build.ignored)) {
+            pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=rotate from=(%d,%d,%d) toHeading=%d yaw=%.1f reason=occupancy",
+                    from.key.x, from.key.z, from.key.heading, heading, yaw);
+            return;
+        }
+        TrackedPoseKey key = new TrackedPoseKey(from.key.x, from.key.z, heading);
+        pathDebug(vehicle, "POSE_CANDIDATE_PASS", "action=rotate from=(%d,%d,%d) to=(%d,%d,%d) pos=%s yaw=%.1f",
+                from.key.x, from.key.z, from.key.heading, key.x, key.z, key.heading, fmt(from.position), yaw);
+        addTrackedPoseNode(vehicle, build, key, from.position, from, TRACKED_POSE_ROTATION_COST, false);
+    }
+
+    private static void addTrackedPoseTranslation(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseNode from, boolean reverse) {
+        float yaw = trackedPoseYaw(from.key.heading);
+        Vec3 direction = Vec3.directionFromRotation(0.0F, yaw).multiply(1.0D, 0.0D, 1.0D).normalize();
+        if (reverse) direction = direction.scale(-1.0D);
+        Vec3 raw = from.position.add(direction.scale(TRACKED_POSE_FORWARD_STEP));
+        TrackedPoseKey key = trackedPoseKey(build.anchor, raw, from.key.heading);
+        Vec3 quantized = trackedPosePosition(build.anchor, key, from.position.y);
+        if (flatDistance(quantized, from.position) < 0.25D) {
+            pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=%s from=(%d,%d,%d) raw=%s quantized=%s reason=short_edge",
+                    reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading, fmt(raw), fmt(quantized));
+            return;
+        }
+        if (!build.inRange(quantized)) {
+            pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=%s from=(%d,%d,%d) target=%s reason=range",
+                    reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading, fmt(quantized));
+            return;
+        }
+        Vec3 end = sweepTrackedPose(vehicle, from.position, quantized, yaw, build.hull, build.ignored, reverse);
+        if (end == null) {
+            pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=%s from=(%d,%d,%d) target=%s yaw=%.1f reason=sweep",
+                    reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading, fmt(quantized), yaw);
+            return;
+        }
+        pathDebug(vehicle, "POSE_CANDIDATE_PASS", "action=%s from=(%d,%d,%d) to=(%d,%d,%d) planned=%s resolved=%s yaw=%.1f",
+                reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading,
+                key.x, key.z, key.heading, fmt(quantized), fmt(end), yaw);
+        addTrackedPoseNode(vehicle, build, key, end, from, flatDistance(from.position, end) * (reverse ? 1.85D : 1.0D), reverse);
+    }
+
+    private static void addTrackedPoseNode(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseKey key, Vec3 position,
+                                           TrackedPoseNode parent, double cost, boolean reverse) {
+        double total = parent.cost + cost;
+        Double previous = build.costs.get(key);
+        if (previous != null && previous <= total) {
+            pathDebug(vehicle, "POSE_NODE_REJECT", "generation=%d key=(%d,%d,%d) newG=%.3f oldG=%.3f reason=not_better",
+                    build.generation, key.x, key.z, key.heading, total, previous);
+            return;
+        }
+        build.costs.put(key, total);
+        // Weighted A* keeps the open set aimed at the command target.  With an exact OBB test
+        // a broad, unweighted search spent most of its budget rotating through local poses
+        // around the first obstacle before it had advanced down either viable side.
+        double heuristic = flatDistance(position, build.target);
+        TrackedPoseNode opened = new TrackedPoseNode(key, position, parent, total,
+                total + heuristic * TRACKED_POSE_HEURISTIC_WEIGHT, reverse);
+        build.open.add(opened);
+        double bestHeuristic = build.bestNode == null
+                ? Double.POSITIVE_INFINITY : flatDistance(build.bestNode.position, build.target);
+        if (heuristic < bestHeuristic - 1.0E-6D
+                || (Math.abs(heuristic - bestHeuristic) <= 1.0E-6D
+                && (build.bestNode == null || total < build.bestNode.cost))) {
+            build.bestNode = opened;
+        }
+        pathDebug(vehicle, "POSE_NODE_OPEN", "generation=%d key=(%d,%d,%d) pos=%s g=%.3f h=%.3f f=%.3f reverse=%s open=%d",
+                build.generation, key.x, key.z, key.heading, fmt(position), total, heuristic,
+                total + heuristic * TRACKED_POSE_HEURISTIC_WEIGHT, reverse, build.open.size());
+    }
+
+    private static List<TrackedPose> reconstructTrackedPoseRoute(TrackedPoseNode end, float startYaw) {
+        List<TrackedPose> reversed = new ArrayList<>();
+        for (TrackedPoseNode node = end; node != null; node = node.parent) {
+            // The search key uses a coarse heading lattice, but the physical tank does not
+            // begin at that quantized angle.  Retaining the real start yaw prevents a tank at
+            // -17.8 degrees from receiving a fabricated -30 degree pivot before it may climb.
+            float yaw = node.parent == null ? startYaw : trackedPoseYaw(node.key.heading);
+            reversed.add(new TrackedPose(node.position, yaw, node.reverse));
+        }
+        Collections.reverse(reversed);
+        return reversed;
+    }
+
+    /**
+     * OBB-aware string pulling.  The grid search is allowed to discover clearance around an
+     * obstacle, but its cheap 30-degree lattice must not become the driven route.  From each
+     * retained pose, connect to the farthest later pose whose complete pivot and swept hull are
+     * valid.  This removes the two-bend doglegs seen on an otherwise clear road while retaining
+     * the original escape steps when the vehicle starts embedded beside a wall.
+     */
+    private static List<TrackedPose> simplifyTrackedPoseRoute(Entity vehicle, List<TrackedPose> raw,
+                                                               TrackedHull hull, Set<UUID> ignoredVehicles) {
+        if (raw == null || raw.size() < 3) return raw;
+        long started = System.nanoTime();
+        long deadline = started + TRACKED_POSE_SIMPLIFY_BUDGET_NANOS;
+        List<TrackedPose> simplified = new ArrayList<>();
+        simplified.add(raw.get(0));
+        int anchor = 0;
+        while (anchor < raw.size() - 1) {
+            if (System.nanoTime() >= deadline) {
+                for (int i = anchor + 1; i < raw.size(); i++) appendTrackedPose(simplified, raw.get(i));
+                pathDebug(vehicle, "POSE_ROUTE_SIMPLIFY_LIMIT", "rawSteps=%d retainedSteps=%d elapsedMs=%.2f anchor=%d",
+                        raw.size(), simplified.size(), (System.nanoTime() - started) / 1_000_000.0D, anchor);
+                return simplified;
+            }
+            TrackedPoseShortcut shortcut = null;
+            int destination = raw.size() - 1;
+            for (; destination > anchor + 1; destination--) {
+                if (System.nanoTime() >= deadline) break;
+                shortcut = trackedPoseShortcut(vehicle, raw.get(anchor), raw.get(destination), hull, ignoredVehicles, deadline);
+                if (shortcut != null) break;
+            }
+            if (shortcut == null) {
+                appendTrackedPose(simplified, raw.get(anchor + 1));
+                pathDebug(vehicle, "POSE_SHORTCUT_KEEP", "from=%d to=%d reason=no_clear_farther_segment",
+                        anchor, anchor + 1);
+                anchor++;
+                continue;
+            }
+            for (TrackedPose pose : shortcut.steps) appendTrackedPose(simplified, pose);
+            pathDebug(vehicle, "POSE_SHORTCUT_APPLY", "from=%d to=%d skipped=%d yaw=%.1f generated=%d",
+                    anchor, destination, destination - anchor - 1, shortcut.yaw, shortcut.steps.size());
+            anchor = destination;
+        }
+        pathDebug(vehicle, "POSE_ROUTE_SIMPLIFIED", "rawSteps=%d simplifiedSteps=%d",
+                raw.size(), simplified.size());
+        return simplified;
+    }
+
+    private static TrackedPoseShortcut trackedPoseShortcut(Entity vehicle, TrackedPose from, TrackedPose to,
+                                                            TrackedHull hull, Set<UUID> ignoredVehicles, long deadline) {
+        Vec3 horizontal = to.position.subtract(from.position).multiply(1.0D, 0.0D, 1.0D);
+        if (horizontal.lengthSqr() < 1.0E-6D) return null;
+        float yaw = yawTo(horizontal);
+        if (!canTrackedPosePivot(vehicle, from.position, from.yaw, yaw, hull, ignoredVehicles)) return null;
+        Vec3 reached = sweepTrackedPose(vehicle, from.position, to.position, yaw, hull, ignoredVehicles, false, deadline);
+        if (reached == null || flatDistance(reached, to.position) > 0.10D) return null;
+
+        List<TrackedPose> steps = new ArrayList<>();
+        if (Math.abs(Mth.wrapDegrees(yaw - from.yaw)) > TRACKED_POSE_YAW_TOLERANCE) {
+            steps.add(new TrackedPose(from.position, yaw, false));
+        }
+        int segments = Math.max(1, Mth.ceil(horizontal.length() / TRACKED_POSE_FORWARD_STEP));
+        Vec3 previous = from.position;
+        for (int i = 1; i <= segments; i++) {
+            if (System.nanoTime() >= deadline) return null;
+            double fraction = (double) i / segments;
+            Vec3 raw = new Vec3(Mth.lerp(fraction, from.position.x, to.position.x), previous.y,
+                    Mth.lerp(fraction, from.position.z, to.position.z));
+            Vec3 next = resolveTrackedPosePosition(vehicle, raw, yaw, hull, ignoredVehicles, previous.y);
+            if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
+            steps.add(new TrackedPose(next, yaw, false));
+            previous = next;
+        }
+        return new TrackedPoseShortcut(yaw, List.copyOf(steps));
+    }
+
+    private static void appendTrackedPose(List<TrackedPose> route, TrackedPose pose) {
+        if (route.isEmpty()) {
+            route.add(pose);
+            return;
+        }
+        TrackedPose last = route.get(route.size() - 1);
+        if (last.position.equals(pose.position)
+                && Math.abs(Mth.wrapDegrees(last.yaw - pose.yaw)) <= 0.01F
+                && last.reverse == pose.reverse) return;
+        route.add(pose);
+    }
+
+    private record TrackedPoseShortcut(float yaw, List<TrackedPose> steps) {}
+
+    private static void installTrackedPoseRoute(ServerPlayer player, Entity vehicle, Vec3 target, Vec3 safe,
+                                                long generation, TrackedHull hull, List<TrackedPose> steps) {
+        if (steps == null || steps.isEmpty()) return;
+        TrackedPoseRoute route = new TrackedPoseRoute(target, safe, generation, hull, steps);
+        TRACKED_POSE_ROUTES.put(vehicle.getUUID(), route);
+        TRACKED_PROXY_DRIVE_UNTIL.remove(vehicle.getUUID());
+        CompoundTag data = vehicle.getPersistentData();
+        data.putDouble(SAFE_TARGET_X, safe.x);
+        data.putDouble(SAFE_TARGET_Y, safe.y);
+        data.putDouble(SAFE_TARGET_Z, safe.z);
+        data.remove(PATH_BLOCKED);
+        List<Vec3> visible = steps.stream().map(TrackedPose::position).toList();
+        storeRoute(vehicle, safe, visible, Math.min(1, Math.max(0, visible.size() - 1)));
+        refreshPlannedPath(player, vehicle, visible);
+        for (int index = 0; index < steps.size(); index++) {
+            TrackedPose step = steps.get(index);
+            pathDebug(vehicle, "POSE_ROUTE_STEP", "generation=%d index=%d/%d pose=%s yaw=%.1f reverse=%s",
+                    generation, index, steps.size(), fmt(step.position), step.yaw, step.reverse);
+        }
+    }
+
+    private static void failTrackedPoseRoute(Entity vehicle, TrackedPoseRouteBuild build, String reason) {
+        TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+        CompoundTag data = vehicle.getPersistentData();
+        data.putBoolean(PATH_BLOCKED, true);
+        data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 60L);
+        pathDebug(vehicle, "POSE_ROUTE_BLOCKED", "generation=%d expanded=%d reason=%s target=%s",
+                build.generation, build.expanded, reason, fmt(build.target));
+        if (!canTrackedPoseOccupy(vehicle, vehicle.position(), vehicle.getYRot(), build.hull,
+                Set.of(vehicle.getUUID()))) {
+            int nativeStuckTick = vehicle instanceof AbstractVehicle chassis && chassis.physicsEngine != null
+                    ? chassis.physicsEngine.stuckTick : 0;
+            if (isTrackedPhysicallyStuck(vehicle)) {
+                pathDebug(vehicle, "POSE_START_EMBEDDED", "generation=%d expanded=%d pose=%s yaw=%.1f nativeStuckTick=%d action=recovery",
+                        build.generation, build.expanded, fmt(vehicle.position()), vehicle.getYRot(), nativeStuckTick);
+                beginTrackedRecovery(vehicle, build.target);
+            } else {
+                // A disagreement between the conservative navigation proxy and native physics
+                // is not proof that the tank is wedged.  This most often occurs when the entity
+                // centre is over a ditch while the front and rear tracks remain supported.  Do
+                // not neutral-lock such a pose: let native physics drive toward the command and
+                // let the motion watchdog promote an actual twelve-tick stall to recovery.
+                data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 8L);
+                TRACKED_PROXY_DRIVE_UNTIL.put(vehicle.getUUID(), vehicle.level().getGameTime() + 20L);
+                pathDebug(vehicle, "POSE_START_PROXY_CONFLICT", "generation=%d expanded=%d pose=%s yaw=%.1f nativeStuckTick=%d action=native_drive_watchdog",
+                        build.generation, build.expanded, fmt(vehicle.position()), vehicle.getYRot(), nativeStuckTick);
+            }
+        }
+    }
+
+    private static boolean moveTrackedPoseRoute(ServerPlayer player, Entity vehicle, Vec3 target, Vec3 safeTarget, VehicleShape shape) {
+        TrackedRecovery recovery = TRACKED_RECOVERIES.get(vehicle.getUUID());
+        if (recovery == null && isTrackedPhysicallyStuck(vehicle)) {
+            recovery = beginTrackedRecovery(vehicle, target);
+        }
+        if (recovery != null) {
+            applyTrackedControl(vehicle, trackedRecoveryControl(vehicle, recovery));
+            return true;
+        }
+        TrackedPoseRouteBuild build = TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+        if (build != null) {
+            // The planner holds position at its snapshot origin.  For a tracked vehicle an
+            // "up" flag is not a brake; native physics brakes positive forward velocity with
+            // a backward key, so use the real native braking input here.
+            applyTrackedControl(vehicle, trackedBrakeControl(vehicle));
+            alignMainWeaponsToYaw(vehicle, trackedWeaponAimYaw(vehicle, null, build, target), true);
+            return true;
+        }
+        TrackedPoseRoute route = TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+        if (route == null || !route.matches(target)) {
+            if (vehicle.level().getGameTime() >= vehicle.getPersistentData().getLong(REPLAN_AFTER)) {
+                prepareTrackedPoseRoute(player, vehicle, target, Set.of(vehicle.getUUID()));
+            }
+            applyTrackedControl(vehicle, trackedProxyDriveActive(vehicle)
+                    ? trackedProxyConflictControl(vehicle, target)
+                    : trackedBrakeControl(vehicle));
+            alignMainWeaponsToYaw(vehicle, trackedWeaponAimYaw(vehicle, null,
+                    TRACKED_POSE_BUILDS.get(vehicle.getUUID()), target), true);
+            return true;
+        }
+
+        applyTrackedControl(vehicle, trackedPoseControl(vehicle, route));
+        alignMainWeaponsToYaw(vehicle, trackedWeaponAimYaw(vehicle, route, null, target), true);
+        return true;
+    }
+
+    /**
+     * Produces exactly one native-tick command for a pose route.  This method is shared by
+     * Dominion's command callback and tickGroundControl(), so route progress cannot be skipped
+     * while the vehicle is travelling quickly.
+     */
+    private static GroundControlState trackedPoseControl(Entity vehicle, TrackedPoseRoute route) {
+        if (route.stopRequested) {
+            if (horizontalSpeed(vehicle) > TRACKED_POSE_PIVOT_SPEED) return trackedBrakeControl(vehicle);
+            route.stopRequested = false;
+            if (route.replanAfterStop) {
+                route.replanAfterStop = false;
+                invalidateTrackedPoseRoute(vehicle, route.target, "obstacle_ahead");
+                return new GroundControlState(false, false, false, false, false);
+            }
+        }
+        while (route.index < route.steps.size()) {
+            TrackedPose step = route.steps.get(route.index);
+            TrackedPose previous = route.index > 0 ? route.steps.get(route.index - 1) : null;
+            double distance = flatDistance(vehicle.position(), step.position);
+            float yawDiff = Mth.wrapDegrees(step.yaw - vehicle.getYRot());
+            boolean rotationStep = previous != null && previous.position.equals(step.position);
+            // A pure rotation state is complete when its heading is complete.  Its recorded
+            // position may be behind the hull after braking, and must not be chased as a point.
+            if (rotationStep && Math.abs(yawDiff) <= TRACKED_POSE_YAW_TOLERANCE) {
+                route.index++;
+                continue;
+            }
+            if (distance <= TRACKED_POSE_REACH_RADIUS
+                    && Math.abs(yawDiff) <= TRACKED_POSE_YAW_TOLERANCE) {
+                route.index++;
+                continue;
+            }
+            // A translation node is complete as soon as the hull centre has crossed its
+            // end plane.  Do not gate this on yaw: the *next* route state is commonly a
+            // pivot, so its yaw intentionally differs exactly when this node must advance.
+            // Keeping the old heading gate made the controller keep accelerating towards a
+            // node already behind it, which is the turn-then-run-past-the-target failure.
+            if (previous != null && !previous.position.equals(step.position)
+                    && hasPassedPoint(vehicle.position(), previous.position, step.position)) {
+                route.index++;
+                continue;
+            }
+            boolean rollingSteer = trackedShouldRollingSteer(rotationStep, yawDiff);
+            if (Math.abs(yawDiff) > TRACKED_POSE_YAW_TOLERANCE && !rollingSteer) {
+                // TrackedVehicle preserves its forward velocity when it receives only a
+                // left/right key.  A pivot therefore must never begin at road speed: brake
+                // first, then rotate after the forward component has genuinely decayed.
+                if (horizontalSpeed(vehicle) > TRACKED_POSE_PIVOT_SPEED) return trackedBrakeControl(vehicle);
+                if (!canTrackedPosePivot(vehicle, vehicle.position(), vehicle.getYRot(), step.yaw, route.hull(), Set.of(vehicle.getUUID()))) {
+                    if (isTrackedPhysicallyStuck(vehicle)) {
+                        beginTrackedRecovery(vehicle, route.target);
+                        return trackedBrakeControl(vehicle);
+                    }
+                    // The navigation proxy is deliberately conservative and, on a slope,
+                    // its yaw-only hull can overlap terrain already supporting the pitched
+                    // physical chassis.  A proxy veto must never deadlock a pose that native
+                    // physics still considers movable.  Let native collision resolve the
+                    // pivot; the motion watchdog below turns a genuinely failed manoeuvre
+                    // into recovery after observing actual lack of movement/rotation.
+                    pathDebug(vehicle, "POSE_PIVOT_PROXY_BYPASS",
+                            "index=%d yawDiff=%.2f nativeStuckTick=0 action=native_pivot", route.index, yawDiff);
+                }
+                boolean right = yawDiff > 0.0F;
+                return new GroundControlState(false, false, right, !right, false);
+            }
+            if (distance <= TRACKED_POSE_REACH_RADIUS) {
+                route.index++;
+                continue;
+            }
+            Vec3 verified = sweepTrackedPose(vehicle, vehicle.position(), step.position, step.yaw,
+                    route.hull(), Set.of(vehicle.getUUID()), step.reverse);
+            if (verified == null || flatDistance(verified, step.position) > 0.55D) {
+                if (isTrackedPhysicallyStuck(vehicle)) {
+                    beginTrackedRecovery(vehicle, route.target);
+                } else {
+                    route.stopRequested = true;
+                    route.replanAfterStop = true;
+                }
+                return trackedBrakeControl(vehicle);
+            }
+
+            double speed = horizontalSpeed(vehicle);
+            double clearance = trackedStraightClearance(vehicle, route);
+            double stoppingDistance = trackedNativeStoppingDistance(speed);
+            // Full throttle is retained until the exact native braking distance of the next
+            // pivot/final point.  Once braking starts it is latched until actually stopped;
+            // otherwise binary forward/backward controls oscillate and roll through the turn.
+            if (clearance <= stoppingDistance + TRACKED_POSE_REACH_RADIUS) {
+                route.stopRequested = true;
+                return trackedBrakeControl(vehicle);
+            }
+
+            // Recheck enough of the already planned straight section to guarantee that the
+            // current velocity can stop before a newly placed or previously missed wall.
+            double safetyHorizon = Math.min(clearance,
+                    stoppingDistance + Math.max(speed, TRACKED_POSE_FORWARD_STEP) + TRACKED_POSE_REACH_RADIUS);
+            if (!trackedRouteHorizonClear(vehicle, route, safetyHorizon)) {
+                route.stopRequested = true;
+                route.replanAfterStop = true;
+                return trackedBrakeControl(vehicle);
+            }
+            boolean steerRight = rollingSteer && (step.reverse ? yawDiff < 0.0F : yawDiff > 0.0F);
+            boolean steerLeft = rollingSteer && (step.reverse ? yawDiff > 0.0F : yawDiff < 0.0F);
+            if (rollingSteer) {
+                pathDebug(vehicle, "POSE_ROLLING_STEER", "index=%d yawDiff=%.2f reverse=%s keys=f:%s,b:%s,r:%s,l:%s",
+                        route.index, yawDiff, step.reverse, !step.reverse, step.reverse, steerRight, steerLeft);
+            }
+            return new GroundControlState(!step.reverse, step.reverse, steerRight, steerLeft, false);
+        }
+        // Keep this finished route installed as a velocity hold.  Removing it would leave the
+        // last forward key latched until the next high-level command callback, which was the
+        // source of the long drive past the selected point.
+        if (flatDistance(route.safe, route.target) > TRACKED_POSE_GOAL_RADIUS + 0.25D) {
+            invalidateTrackedPoseRoute(vehicle, route.target, "partial_complete");
+            return new GroundControlState(false, false, false, false, false);
+        }
+        return trackedBrakeControl(vehicle);
+    }
+
+    static boolean trackedShouldRollingSteer(boolean rotationStep, float yawDiff) {
+        double absoluteYaw = Math.abs(Mth.wrapDegrees(yawDiff));
+        return !rotationStep
+                && absoluteYaw > TRACKED_POSE_YAW_TOLERANCE
+                && absoluteYaw <= TRACKED_POSE_ROLLING_STEER_MAX_YAW;
+    }
+
+    private static boolean trackedProxyDriveActive(Entity vehicle) {
+        Long until = TRACKED_PROXY_DRIVE_UNTIL.get(vehicle.getUUID());
+        if (until == null) return false;
+        if (vehicle.level().getGameTime() <= until) return true;
+        TRACKED_PROXY_DRIVE_UNTIL.remove(vehicle.getUUID(), until);
+        return false;
+    }
+
+    /** Native-control escape for a pose rejected only by the conservative planning proxy. */
+    private static GroundControlState trackedProxyConflictControl(Entity vehicle, Vec3 target) {
+        if (target == null) return trackedBrakeControl(vehicle);
+        Vec3 delta = target.subtract(vehicle.position()).multiply(1.0D, 0.0D, 1.0D);
+        double distance = delta.length();
+        if (distance <= TRACKED_POSE_REACH_RADIUS || delta.lengthSqr() < 1.0E-6D) {
+            return trackedBrakeControl(vehicle);
+        }
+        float targetYaw = yawTo(delta);
+        float yawDiff = Mth.wrapDegrees(targetYaw - vehicle.getYRot());
+        boolean reverse = trackedShouldDirectShortReverse(vehicle.getYRot(), targetYaw, distance);
+        if (!reverse && Math.abs(yawDiff) > TRACKED_POSE_ROLLING_STEER_MAX_YAW) {
+            if (horizontalSpeed(vehicle) > TRACKED_POSE_PIVOT_SPEED) return trackedBrakeControl(vehicle);
+            boolean right = yawDiff > 0.0F;
+            pathDebug(vehicle, "POSE_PROXY_NATIVE_DRIVE", "mode=pivot target=%s distance=%.2f yawDiff=%.1f keys=r:%s,l:%s",
+                    fmt(target), distance, yawDiff, right, !right);
+            return new GroundControlState(false, false, right, !right, false);
+        }
+        boolean right = reverse ? yawDiff < 0.0F : yawDiff > TRACKED_POSE_YAW_TOLERANCE;
+        boolean left = reverse ? yawDiff > 0.0F : yawDiff < -TRACKED_POSE_YAW_TOLERANCE;
+        pathDebug(vehicle, "POSE_PROXY_NATIVE_DRIVE", "mode=%s target=%s distance=%.2f yawDiff=%.1f keys=f:%s,b:%s,r:%s,l:%s",
+                reverse ? "reverse" : "forward", fmt(target), distance, yawDiff, !reverse, reverse, right, left);
+        return new GroundControlState(!reverse, reverse, right, left, false);
+    }
+
+    private static void applyTrackedControl(Entity vehicle, GroundControlState control) {
+        applyControl(vehicle, control.forward(), control.backward(), control.right(), control.left(), control.brake());
+    }
+
+    /** Native TrackedVehicle ignores control.up; backward is its positive-speed brake. */
+    private static GroundControlState trackedBrakeControl(Entity vehicle) {
+        Vec3 velocity = vehicle.getDeltaMovement().multiply(1.0D, 0.0D, 1.0D);
+        if (velocity.lengthSqr() <= 6.25E-4D) return new GroundControlState(false, false, false, false, false);
+        Vec3 look = vehicle.getLookAngle().multiply(1.0D, 0.0D, 1.0D);
+        boolean movingForward = look.lengthSqr() < 1.0E-6D || velocity.normalize().dot(look.normalize()) >= 0.0D;
+        return new GroundControlState(!movingForward, movingForward, false, false, false);
+    }
+
+    /** Exact discrete stopping distance produced by TrackedVehicle's 0.025/tick opposite key. */
+    private static double trackedNativeStoppingDistance(double speed) {
+        double remaining = Math.max(0.0D, speed);
+        double distance = 0.0D;
+        while (remaining > 1.0E-6D) {
+            remaining = Math.max(0.0D, remaining - TRACKED_NATIVE_BRAKE_PER_TICK);
+            distance += remaining;
+        }
+        return distance;
+    }
+
+    /** Distance along the current straight/reverse run before a pivot, direction change, or end. */
+    private static double trackedStraightClearance(Entity vehicle, TrackedPoseRoute route) {
+        if (route.index >= route.steps.size()) return 0.0D;
+        TrackedPose first = route.steps.get(route.index);
+        Vec3 previous = vehicle.position();
+        double distance = 0.0D;
+        for (int index = route.index; index < route.steps.size(); index++) {
+            TrackedPose step = route.steps.get(index);
+            if (step.reverse != first.reverse
+                    || Math.abs(Mth.wrapDegrees(step.yaw - first.yaw)) > TRACKED_POSE_YAW_TOLERANCE) break;
+            distance += flatDistance(previous, step.position);
+            previous = step.position;
+        }
+        return distance;
+    }
+
+    /** Revalidates the route from the actual pose, not merely from its old planned grid nodes. */
+    private static boolean trackedRouteHorizonClear(Entity vehicle, TrackedPoseRoute route, double horizon) {
+        if (horizon <= 1.0E-4D || route.index >= route.steps.size()) return true;
+        TrackedPose first = route.steps.get(route.index);
+        Vec3 previous = vehicle.position();
+        double remaining = horizon;
+        for (int index = route.index; index < route.steps.size() && remaining > 1.0E-4D; index++) {
+            TrackedPose step = route.steps.get(index);
+            if (step.reverse != first.reverse
+                    || Math.abs(Mth.wrapDegrees(step.yaw - first.yaw)) > TRACKED_POSE_YAW_TOLERANCE) break;
+            double segment = flatDistance(previous, step.position);
+            if (segment <= 1.0E-6D) {
+                previous = step.position;
+                continue;
+            }
+            Vec3 target = segment <= remaining
+                    ? step.position
+                    : previous.add(step.position.subtract(previous).scale(remaining / segment));
+            Vec3 reached = sweepTrackedPose(vehicle, previous, target, step.yaw,
+                    route.hull(), Set.of(vehicle.getUUID()), step.reverse);
+            if (reached == null || flatDistance(reached, target) > TRACKED_POSE_REACH_RADIUS) return false;
+            remaining -= Math.min(segment, remaining);
+            previous = target;
+        }
+        return true;
+    }
+
+    private static boolean isTrackedPhysicallyStuck(Entity vehicle) {
+        return vehicle instanceof AbstractVehicle chassis
+                && chassis.physicsEngine != null
+                && chassis.physicsEngine.stuckTick >= 2;
+    }
+
+    private static Vec3 trackedStoredTarget(Entity vehicle) {
+        CompoundTag data = vehicle.getPersistentData();
+        if (data.contains(FINAL_TARGET_X) && data.contains(FINAL_TARGET_Z)) {
+            return new Vec3(data.getDouble(FINAL_TARGET_X), vehicle.getY(), data.getDouble(FINAL_TARGET_Z));
+        }
+        return vehicle.position();
+    }
+
+    private static TrackedRecovery beginTrackedRecovery(Entity vehicle, Vec3 target) {
+        TrackedRecovery existing = TRACKED_RECOVERIES.get(vehicle.getUUID());
+        if (existing != null) return existing;
+        TRACKED_POSE_ROUTES.remove(vehicle.getUUID());
+        TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+        TrackedHull hull = vehicle instanceof AbstractVehicle chassis ? TrackedHull.from(chassis) : null;
+        TrackedRecovery recovery = new TrackedRecovery(vehicle.position(), target == null ? trackedStoredTarget(vehicle) : target, hull);
+        TRACKED_RECOVERIES.put(vehicle.getUUID(), recovery);
+        pathDebug(vehicle, "POSE_RECOVERY_START", "stuckTick=%d target=%s",
+                vehicle instanceof AbstractVehicle chassis && chassis.physicsEngine != null ? chassis.physicsEngine.stuckTick : 0,
+                fmt(recovery.target));
+        return recovery;
+    }
+
+    /** Brake, reverse clear of the contact, brake again, then permit a fresh pose search. */
+    private static GroundControlState trackedRecoveryControl(Entity vehicle, TrackedRecovery recovery) {
+        long gameTime = vehicle.level().getGameTime();
+        boolean newTick = recovery.lastTick != gameTime;
+        if (newTick) {
+            recovery.lastTick = gameTime;
+            recovery.ticks++;
+        }
+        double speed = horizontalSpeed(vehicle);
+        if (recovery.brakingBeforeReverse) {
+            if (speed > TRACKED_POSE_PIVOT_SPEED) return trackedBrakeControl(vehicle);
+            recovery.brakingBeforeReverse = false;
+            recovery.reverseOrigin = vehicle.position();
+        }
+        if (recovery.brakingAfterReverse) {
+            if (speed > TRACKED_POSE_PIVOT_SPEED) return trackedBrakeControl(vehicle);
+            TRACKED_RECOVERIES.remove(vehicle.getUUID());
+            if (vehicle instanceof AbstractVehicle chassis && chassis.physicsEngine != null) chassis.physicsEngine.stuckTick = 0;
+            CompoundTag data = vehicle.getPersistentData();
+            data.remove(PATH_BLOCKED);
+            data.putLong(REPLAN_AFTER, gameTime);
+            pathDebug(vehicle, "POSE_RECOVERY_DONE", "moved=%.2f ticks=%d target=%s",
+                    flatDistance(recovery.reverseOrigin, vehicle.position()), recovery.ticks, fmt(recovery.target));
+            return new GroundControlState(false, false, false, false, false);
+        }
+
+        if (newTick) recovery.reverseTicks++;
+        double moved = flatDistance(recovery.reverseOrigin, vehicle.position());
+        if (recovery.reverseTicks >= 24 && moved < 0.20D && recovery.hull != null
+                && vehicle instanceof AbstractVehicle chassis) {
+            Vec3 escape = findTrackedDepenetrationPose(vehicle, recovery);
+            if (escape != null) {
+                Vec3 before = vehicle.position();
+                vehicle.setPos(escape.x, escape.y, escape.z);
+                vehicle.setDeltaMovement(Vec3.ZERO);
+                chassis.updateOBBs();
+                if (chassis.physicsEngine != null) chassis.physicsEngine.stuckTick = 0;
+                recovery.reverseOrigin = escape;
+                recovery.brakingAfterReverse = true;
+                pathDebug(vehicle, "POSE_RECOVERY_DEPENETRATE", "from=%s to=%s distance=%.3f reverseTicks=%d",
+                        fmt(before), fmt(escape), flatDistance(before, escape), recovery.reverseTicks);
+                return new GroundControlState(false, false, false, false, false);
+            }
+            pathDebug(vehicle, "POSE_RECOVERY_DEPENETRATE_FAILED", "origin=%s yaw=%.1f reverseTicks=%d",
+                    fmt(vehicle.position()), vehicle.getYRot(), recovery.reverseTicks);
+        }
+        if (moved >= TRACKED_RECOVERY_DISTANCE || recovery.ticks >= TRACKED_RECOVERY_MAX_TICKS) {
+            recovery.brakingAfterReverse = true;
+            return trackedBrakeControl(vehicle);
+        }
+
+        // A straight reverse clears a frontal collision.  If it has made no useful progress,
+        // alternate a reverse steering input so a corner/side contact cannot lock controls.
+        boolean steer = recovery.reverseTicks > 16 && moved < 0.35D;
+        boolean right = ((recovery.reverseTicks / 12) & 1) == 0;
+        return new GroundControlState(false, true, steer && right, steer && !right, false);
+    }
+
+    private static Vec3 findTrackedDepenetrationPose(Entity vehicle, TrackedRecovery recovery) {
+        Vec3 origin = vehicle.position();
+        Vec3 forward = vehicle.getLookAngle().multiply(1.0D, 0.0D, 1.0D);
+        if (forward.lengthSqr() < 1.0E-6D) forward = Vec3.directionFromRotation(0.0F, vehicle.getYRot());
+        forward = forward.normalize();
+        Vec3 backward = forward.scale(-1.0D);
+        Vec3 right = new Vec3(-forward.z, 0.0D, forward.x);
+        double[] lateralOffsets = {0.0D, 0.25D, -0.25D, 0.50D, -0.50D, 0.75D, -0.75D, 1.0D, -1.0D};
+        for (double distance = 0.25D; distance <= 4.0D; distance += 0.25D) {
+            for (double lateral : lateralOffsets) {
+                Vec3 raw = origin.add(backward.scale(distance)).add(right.scale(lateral));
+                Vec3 candidate = resolveTrackedPosePosition(vehicle, raw, vehicle.getYRot(), recovery.hull,
+                        Set.of(vehicle.getUUID()), origin.y);
+                pathDebug(vehicle, candidate == null ? "POSE_DEPENETRATE_CANDIDATE_REJECT" : "POSE_DEPENETRATE_CANDIDATE_PASS",
+                        "raw=%s distance=%.2f lateral=%.2f resolved=%s", fmt(raw), distance, lateral, fmt(candidate));
+                if (candidate != null) return candidate;
+            }
+        }
+        for (double distance = 0.50D; distance <= 4.0D; distance += 0.50D) {
+            for (int angle = 0; angle < 360; angle += 15) {
+                double radians = Math.toRadians(angle);
+                Vec3 raw = origin.add(Math.cos(radians) * distance, 0.0D, Math.sin(radians) * distance);
+                Vec3 candidate = resolveTrackedPosePosition(vehicle, raw, vehicle.getYRot(), recovery.hull,
+                        Set.of(vehicle.getUUID()), origin.y);
+                pathDebug(vehicle, candidate == null ? "POSE_DEPENETRATE_CANDIDATE_REJECT" : "POSE_DEPENETRATE_CANDIDATE_PASS",
+                        "raw=%s radius=%.2f angle=%d resolved=%s fallback=radial", fmt(raw), distance, angle, fmt(candidate));
+                if (candidate != null) return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static void traceTrackedPoseTick(Entity vehicle, AbstractVehicle chassis, TrackedPoseRoute route,
+                                             TrackedRecovery recovery, GroundControlState control) {
+        int stuckTick = chassis.physicsEngine == null ? 0 : chassis.physicsEngine.stuckTick;
+        if (recovery != null) {
+            String stage = recovery.brakingBeforeReverse ? "brake_before_reverse"
+                    : recovery.brakingAfterReverse ? "brake_after_reverse" : "reverse_escape";
+            pathDebug(vehicle, "POSE_CONTROL_TICK", "mode=recovery stage=%s ticks=%d reverseTicks=%d moved=%.3f stuckTick=%d power=%.1f keys=f:%s,b:%s,r:%s,l:%s",
+                    stage, recovery.ticks, recovery.reverseTicks,
+                    flatDistance(recovery.reverseOrigin, vehicle.position()), stuckTick, chassis.getPower(),
+                    control.forward(), control.backward(), control.right(), control.left());
+            return;
+        }
+        if (route == null || route.index >= route.steps.size()) {
+            pathDebug(vehicle, "POSE_CONTROL_TICK", "mode=%s index=%d total=%d stuckTick=%d power=%.1f keys=f:%s,b:%s,r:%s,l:%s",
+                    route == null ? "no_route" : "route_finished", route == null ? -1 : route.index,
+                    route == null ? 0 : route.steps.size(), stuckTick, chassis.getPower(),
+                    control.forward(), control.backward(), control.right(), control.left());
+            return;
+        }
+        TrackedPose step = route.steps.get(route.index);
+        TrackedPose previous = route.index > 0 ? route.steps.get(route.index - 1) : null;
+        boolean rotation = previous != null && previous.position.equals(step.position);
+        double distance = flatDistance(vehicle.position(), step.position);
+        double yawDiff = Mth.wrapDegrees(step.yaw - vehicle.getYRot());
+        double speed = horizontalSpeed(vehicle);
+        double stopping = trackedNativeStoppingDistance(speed);
+        double clearance = rotation ? 0.0D : trackedStraightClearance(vehicle, route);
+        pathDebug(vehicle, "POSE_CONTROL_TICK", "mode=route generation=%d index=%d/%d step=%s stepYaw=%.1f reverse=%s rotation=%s distance=%.3f yawDiff=%.2f speed=%.3f stopDistance=%.3f clearance=%.3f stopRequested=%s replanAfterStop=%s stuckTick=%d power=%.1f keys=f:%s,b:%s,r:%s,l:%s",
+                route.generation, route.index, route.steps.size(), fmt(step.position), step.yaw, step.reverse,
+                rotation, distance, yawDiff, speed, stopping, clearance, route.stopRequested,
+                route.replanAfterStop, stuckTick, chassis.getPower(), control.forward(), control.backward(), control.right(), control.left());
+    }
+
+    private static void watchTrackedMotion(Entity vehicle, AbstractVehicle chassis, TrackedPoseRoute route,
+                                           TrackedRecovery recovery, GroundControlState control) {
+        long now = vehicle.level().getGameTime();
+        TrackedMotionWatch watch = TRACKED_MOTION_WATCHES.computeIfAbsent(vehicle.getUUID(),
+                ignored -> new TrackedMotionWatch(vehicle.position(), vehicle.getYRot(), now));
+        if (watch.lastTick == now) return;
+        double moved = flatDistance(watch.lastPosition, vehicle.position());
+        double yawMoved = Math.abs(Mth.wrapDegrees(vehicle.getYRot() - watch.lastYaw));
+        boolean commandedMotion = recovery == null
+                && (((control.forward() || control.backward()) && chassis.getPower() > 20.0F)
+                || control.right() || control.left());
+        if (commandedMotion && moved < 0.015D && yawMoved < 0.35D) watch.stalledTicks++;
+        else watch.stalledTicks = 0;
+        watch.lastPosition = vehicle.position();
+        watch.lastYaw = vehicle.getYRot();
+        watch.lastTick = now;
+        pathDebug(vehicle, "POSE_MOTION_WATCH", "commandedMotion=%s moved=%.4f yawMoved=%.3f stalledTicks=%d stuckTick=%d power=%.1f",
+                commandedMotion, moved, yawMoved, watch.stalledTicks,
+                chassis.physicsEngine == null ? 0 : chassis.physicsEngine.stuckTick, chassis.getPower());
+        if (watch.stalledTicks >= 12 && !TRACKED_RECOVERIES.containsKey(vehicle.getUUID())) {
+            pathDebug(vehicle, "POSE_STALL_DETECTED", "moved=%.4f yawMoved=%.3f stalledTicks=%d nativeStuckTick=%d",
+                    moved, yawMoved, watch.stalledTicks, chassis.physicsEngine == null ? 0 : chassis.physicsEngine.stuckTick);
+            beginTrackedRecovery(vehicle, route == null ? trackedStoredTarget(vehicle) : route.target);
+            watch.stalledTicks = 0;
+        }
+    }
+
+    private static void invalidateTrackedPoseRoute(Entity vehicle, Vec3 target, String reason) {
+        TRACKED_POSE_ROUTES.remove(vehicle.getUUID());
+        CompoundTag data = vehicle.getPersistentData();
+        // trackedPoseReplanCoolingDown checks PATH_BLOCKED as well as REPLAN_AFTER.  Omitting
+        // this flag made the four-tick cooldown a no-op and caused hundreds of identical
+        // route-build/pivot-reject cycles while the tank remained stationary.
+        data.putBoolean(PATH_BLOCKED, true);
+        data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 4L);
+        pathDebug(vehicle, "POSE_ROUTE_INVALID", "reason=%s target=%s", reason, fmt(target));
+    }
+
+    private static boolean canTrackedPosePivot(Entity vehicle, Vec3 position, float fromYaw, float toYaw,
+                                                TrackedHull hull, Set<UUID> ignoredVehicles) {
+        float diff = Mth.wrapDegrees(toYaw - fromYaw);
+        int samples = Math.max(1, Mth.ceil(Math.abs(diff) / 5.0F));
+        for (int i = 1; i <= samples; i++) {
+            float yaw = Mth.wrapDegrees(fromYaw + diff * i / samples);
+            if (!canTrackedPoseOccupy(vehicle, position, yaw, hull, ignoredVehicles)) return false;
+        }
+        return true;
+    }
+
+    /** Returns the reached, terrain-following end position, or null when any short pose is impossible. */
+    private static Vec3 sweepTrackedPose(Entity vehicle, Vec3 from, Vec3 target, float yaw, TrackedHull hull,
+                                         Set<UUID> ignoredVehicles, boolean reverse) {
+        return sweepTrackedPose(vehicle, from, target, yaw, hull, ignoredVehicles, reverse, Long.MAX_VALUE);
+    }
+
+    private static Vec3 sweepTrackedPose(Entity vehicle, Vec3 from, Vec3 target, float yaw, TrackedHull hull,
+                                         Set<UUID> ignoredVehicles, boolean reverse, long deadlineNanos) {
+        TrackedPoseRouteBuild activeBuild = vehicle == null ? null : TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+        if (activeBuild != null) activeBuild.sweeps++;
+        double distance = flatDistance(from, target);
+        if (distance < 1.0E-6D) return resolveTrackedPosePosition(vehicle, target, yaw, hull, ignoredVehicles, from.y);
+        int samples = Math.max(1, Mth.ceil(distance / 0.25D));
+        Vec3 previous = from;
+        for (int i = 1; i <= samples; i++) {
+            if (System.nanoTime() >= deadlineNanos) return null;
+            double t = (double) i / samples;
+            Vec3 raw = new Vec3(Mth.lerp(t, from.x, target.x), previous.y, Mth.lerp(t, from.z, target.z));
+            Vec3 next = resolveTrackedPosePosition(vehicle, raw, yaw, hull, ignoredVehicles, previous.y);
+            if (next == null) {
+                pathDebug(vehicle, "POSE_SWEEP_REJECT", "from=%s target=%s yaw=%.1f reverse=%s sample=%d/%d raw=%s previous=%s reason=no_pose",
+                        fmt(from), fmt(target), yaw, reverse, i, samples, fmt(raw), fmt(previous));
+                return null;
+            }
+            if (!terrainStepAllowed(previous.y, next.y)) {
+                pathDebug(vehicle, "POSE_SWEEP_REJECT", "from=%s target=%s yaw=%.1f reverse=%s sample=%d/%d previous=%s next=%s dy=%.3f maxDy=%.3f reason=step_height",
+                        fmt(from), fmt(target), yaw, reverse, i, samples, fmt(previous), fmt(next), next.y - previous.y, MAX_TRAVEL_STEP_HEIGHT);
+                return null;
+            }
+            previous = next;
+        }
+        pathDebug(vehicle, "POSE_SWEEP_PASS", "from=%s target=%s resolved=%s yaw=%.1f reverse=%s samples=%d",
+                fmt(from), fmt(target), fmt(previous), yaw, reverse, samples);
+        return previous;
+    }
+
+    private static Vec3 resolveTrackedPosePosition(Entity vehicle, Vec3 around, float yaw, TrackedHull hull,
+                                                    Set<UUID> ignoredVehicles, double referenceY) {
+        if (!(vehicle.level() instanceof ServerLevel level)) return around;
+        // A long chassis may bridge a narrow gap with no floor below its entity centre.  Preserve
+        // the previous support plane first; the footprint support probes below decide whether
+        // enough of the actual tracks are still grounded.
+        Vec3 bridged = new Vec3(around.x, referenceY, around.z);
+        if (canTrackedPoseOccupy(vehicle, bridged, yaw, hull, ignoredVehicles)) {
+            pathDebug(vehicle, "POSE_RESOLVE_PASS", "around=%s referenceY=%.3f candidate=%s yaw=%.1f source=footprint_bridge",
+                    fmt(around), referenceY, fmt(bridged), yaw);
+            return bridged;
+        }
+        BlockPos base = BlockPos.containing(around.x, referenceY, around.z);
+        for (int dy = 2; dy >= -4; dy--) {
+            BlockPos floor = base.offset(0, dy - 1, 0);
+            if (!level.getBlockState(floor).isSolid()) continue;
+            Vec3 candidate = new Vec3(around.x, floor.getY() + 1.0D + hull.entityGroundOffset, around.z);
+            if (canTrackedPoseOccupy(vehicle, candidate, yaw, hull, ignoredVehicles)) {
+                pathDebug(vehicle, "POSE_RESOLVE_PASS", "around=%s referenceY=%.3f floor=(%d,%d,%d) floorState=%s groundOffset=%.3f candidate=%s yaw=%.1f",
+                        fmt(around), referenceY, floor.getX(), floor.getY(), floor.getZ(),
+                        level.getBlockState(floor).getBlock(), hull.entityGroundOffset, fmt(candidate), yaw);
+                return candidate;
+            }
+            pathDebug(vehicle, "POSE_RESOLVE_TRY_REJECT", "around=%s referenceY=%.3f floor=(%d,%d,%d) floorState=%s groundOffset=%.3f candidate=%s yaw=%.1f",
+                    fmt(around), referenceY, floor.getX(), floor.getY(), floor.getZ(),
+                    level.getBlockState(floor).getBlock(), hull.entityGroundOffset, fmt(candidate), yaw);
+        }
+        int terrainY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, Mth.floor(around.x), Mth.floor(around.z));
+        double entityY = terrainY + hull.entityGroundOffset;
+        if (Math.abs(entityY - referenceY) > 1.0E-6D) {
+            Vec3 candidate = new Vec3(around.x, entityY, around.z);
+            if (canTrackedPoseOccupy(vehicle, candidate, yaw, hull, ignoredVehicles)) {
+                pathDebug(vehicle, "POSE_RESOLVE_PASS", "around=%s referenceY=%.3f heightmapY=%d groundOffset=%.3f candidate=%s yaw=%.1f source=heightmap",
+                        fmt(around), referenceY, terrainY, hull.entityGroundOffset, fmt(candidate), yaw);
+                return candidate;
+            }
+        }
+        pathDebug(vehicle, "POSE_RESOLVE_REJECT", "around=%s referenceY=%.3f yaw=%.1f base=(%d,%d,%d) heightmapY=%d groundOffset=%.3f reason=no_occupiable_height",
+                fmt(around), referenceY, yaw, base.getX(), base.getY(), base.getZ(), terrainY, hull.entityGroundOffset);
+        return null;
+    }
+
+    /**
+     * Exact YWZJ compatible pose test.  The broad AABB is deliberately first: if that outer
+     * box is clear, the OBB it contains is certainly clear.  Only a broad-phase hit pays for
+     * the native main-cube surface sampling, where ground contact is distinguished from a wall.
+     */
+    private static boolean canTrackedPoseOccupy(Entity vehicle, Vec3 position, float yaw, TrackedHull hull,
+                                                Set<UUID> ignoredVehicles) {
+        if (!(vehicle instanceof AbstractVehicle chassis) || !(vehicle.level() instanceof ServerLevel level)) return true;
+        TrackedPoseRouteBuild activeBuild = TRACKED_POSE_BUILDS.get(vehicle.getUUID());
+        if (activeBuild != null) activeBuild.poseTests++;
+        TrackedPoseCacheKey cacheKey = activeBuild == null ? null : trackedPoseCacheKey(position, yaw);
+        if (cacheKey != null) {
+            Boolean cached = activeBuild.poseCache.get(cacheKey);
+            if (cached != null) {
+                activeBuild.cacheHits++;
+                return cached;
+            }
+        }
+        TrackedPoseTransform transform = hull.transform(chassis, position, yaw);
+        AABB bounds = transform.bounds();
+        int supportMask = trackedPoseSupportMask(level, transform);
+        if (!trackedSupportPatternAccepts((supportMask & 1) != 0, (supportMask & 2) != 0,
+                (supportMask & 4) != 0, (supportMask & 8) != 0, (supportMask & 16) != 0)) {
+            if (activeBuild != null) activeBuild.rejectedPoses++;
+            pathDebug(vehicle, "POSE_OCCUPY_REJECT", "pose=%s yaw=%.1f bounds=%s supportMask=0x%02X reason=no_footprint_support",
+                    fmt(position), yaw, boxBounds(bounds), supportMask);
+            return cacheTrackedPoseResult(activeBuild, cacheKey, false);
+        }
+
+        // Lift the broad box a hair off the supporting ground.  Native physics permits that
+        // contact; it is not an obstacle to driving or pivoting.
+        AABB broadphase = new AABB(bounds.minX, bounds.minY + 0.035D, bounds.minZ,
+                bounds.maxX, bounds.maxY, bounds.maxZ);
+        boolean clearAabb = level.noCollision(vehicle, broadphase);
+        if (!clearAabb && activeBuild != null) activeBuild.obbFallbacks++;
+        BlockPos blockingBlock = clearAabb ? null : trackedPoseConvexBlockingBlock(level, transform);
+        if (blockingBlock != null) {
+            if (activeBuild != null) {
+                activeBuild.rejectedPoses++;
+                activeBuild.convexRejects++;
+            }
+            pathDebug(vehicle, "POSE_OCCUPY_REJECT", "pose=%s yaw=%.1f bounds=%s broadphase=%s block=(%d,%d,%d) blockState=%s lowSideY=%.3f reason=convex_sat",
+                    fmt(position), yaw, boxBounds(bounds), boxBounds(broadphase),
+                    blockingBlock.getX(), blockingBlock.getY(), blockingBlock.getZ(),
+                    level.getBlockState(blockingBlock).getBlock(), hull.lowSideContactY);
+            return cacheTrackedPoseResult(activeBuild, cacheKey, false);
+        }
+
+        for (Entity other : level.getEntities(vehicle, bounds.inflate(0.05D))) {
+            if (other == vehicle || !isInstance(other, VEHICLE_CLASS_NAME)) continue;
+            if (ignoredVehicles != null && ignoredVehicles.contains(other.getUUID())) continue;
+            if (other.getBoundingBox().intersects(bounds.inflate(0.10D))) {
+                if (activeBuild != null) activeBuild.rejectedPoses++;
+                pathDebug(vehicle, "POSE_OCCUPY_REJECT", "pose=%s yaw=%.1f bounds=%s other=%s otherBox=%s reason=vehicle",
+                        fmt(position), yaw, boxBounds(bounds), other.getStringUUID(), boxBounds(other.getBoundingBox()));
+                return cacheTrackedPoseResult(activeBuild, cacheKey, false);
+            }
+        }
+        // Do not use a heightmap over the whole projected hull here.  A house wall or roof
+        // beside a clear corridor appears as a tall "ground" column in that map, which made
+        // every first move near a building fail even though YWZJ's own OBB samples found no
+        // contact.  The centre support probe above plus the native-equivalent surface samples
+        // are the actual traversability authority; sweepTrackedPose still rejects a wall-sized
+        // change along the direction of travel.
+        pathDebug(vehicle, "POSE_OCCUPY_PASS", "pose=%s yaw=%.1f bounds=%s broadphase=%s mode=%s supportMask=0x%02X groundOffset=%.3f",
+                fmt(position), yaw, boxBounds(bounds), boxBounds(broadphase), clearAabb ? "aabb" : "obb_fallback",
+                supportMask, hull.entityGroundOffset);
+        return cacheTrackedPoseResult(activeBuild, cacheKey, true);
+    }
+
+    /** centre/front/rear/left/right bits for support under the yaw-only hull footprint. */
+    private static int trackedPoseSupportMask(ServerLevel level, TrackedPoseTransform transform) {
+        float bottom = -transform.hull.extents.y + 0.05F;
+        float x = transform.hull.extents.x * 0.72F;
+        float z = transform.hull.extents.z * 0.72F;
+        Vector3f[] probes = {
+                new Vector3f(0.0F, bottom, 0.0F),
+                new Vector3f(0.0F, bottom, z),
+                new Vector3f(0.0F, bottom, -z),
+                new Vector3f(x, bottom, 0.0F),
+                new Vector3f(-x, bottom, 0.0F)
+        };
+        int mask = 0;
+        for (int i = 0; i < probes.length; i++) {
+            if (trackedSupportProbe(level, transform.world(probes[i]))) mask |= 1 << i;
+        }
+        return mask;
+    }
+
+    private static boolean trackedSupportProbe(ServerLevel level, Vec3 probe) {
+        int minY = Mth.floor(probe.y - 1.05D);
+        int maxY = Mth.floor(probe.y + MAX_TRAVEL_STEP_HEIGHT + 0.05D);
+        int x = Mth.floor(probe.x), z = Mth.floor(probe.z);
+        for (int y = minY; y <= maxY; y++) {
+            BlockPos block = new BlockPos(x, y, z);
+            VoxelShape shape = level.getBlockState(block).getCollisionShape(level, block);
+            if (shape.isEmpty()) continue;
+            for (AABB local : shape.toAabbs()) {
+                AABB world = local.move(block);
+                if (world.minY <= probe.y + 0.08D
+                        && world.maxY >= probe.y - 0.15D
+                        && world.maxY <= probe.y + MAX_TRAVEL_STEP_HEIGHT + 0.08D) return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean trackedSupportPatternAccepts(boolean center, boolean front, boolean rear,
+                                                boolean left, boolean right) {
+        if (center || front && rear || left && right) return true;
+        int peripheral = (front ? 1 : 0) + (rear ? 1 : 0) + (left ? 1 : 0) + (right ? 1 : 0);
+        return peripheral >= 2;
+    }
+
+    private static boolean cacheTrackedPoseResult(TrackedPoseRouteBuild build, TrackedPoseCacheKey key, boolean result) {
+        if (build != null && key != null) build.poseCache.put(key, result);
+        return result;
+    }
+
+    /** Half-block position cache; yaw remains at five-degree precision for direct shortcuts. */
+    private static TrackedPoseCacheKey trackedPoseCacheKey(Vec3 position, float yaw) {
+        return new TrackedPoseCacheKey((int) Math.round(position.x * 2.0D),
+                (int) Math.round(position.y * 2.0D),
+                (int) Math.round(position.z * 2.0D),
+                Math.round(Mth.wrapDegrees(yaw) / 5.0F));
+    }
+
+    /**
+     * Intermediate collision proxy used only after the broad AABB reports a hit.  It is the
+     * upper, wall-sensitive portion of the main vehicle cube represented by eight vertices.
+     * Minecraft collision shapes are unions of AABBs, so the existing JOML 15-axis SAT gives
+     * an exact prism-vs-shape result without transforming every native surface probe.
+     */
+    private static BlockPos trackedPoseConvexBlockingBlock(ServerLevel level, TrackedPoseTransform transform) {
+        OBB prism = transform.navigationPrism();
+        AABB scan = trackedObbBounds(prism);
+        int minX = Mth.floor(scan.minX), maxX = Mth.floor(scan.maxX - 1.0E-6D);
+        int minY = Mth.floor(scan.minY), maxY = Mth.floor(scan.maxY - 1.0E-6D);
+        int minZ = Mth.floor(scan.minZ), maxZ = Mth.floor(scan.maxZ - 1.0E-6D);
+        for (BlockPos block : BlockPos.betweenClosed(minX, minY, minZ, maxX, maxY, maxZ)) {
+            BlockState state = level.getBlockState(block);
+            VoxelShape shape = state.getCollisionShape(level, block);
+            if (shape.isEmpty()) continue;
+            for (AABB local : shape.toAabbs()) {
+                AABB worldShape = local.move(block);
+                // When the centre probe steps down, the long hull still bridges the preceding
+                // higher block.  Terrain connected to the candidate base and no taller than
+                // the declared one-block step is support, not a wall.  Floating shapes and
+                // taller obstacles continue into the SAT test below.
+                VoxelShape aboveShape = level.getBlockState(block.above()).getCollisionShape(level, block.above());
+                double horizontalDistance = Math.hypot(block.getX() + 0.5D - transform.center.x,
+                        block.getZ() + 0.5D - transform.center.z);
+                if (trackedTerrainContact(transform.entityY, transform.hull.entityGroundOffset, worldShape)
+                        || trackedExposedTerrainContact(transform.entityY, transform.hull.entityGroundOffset,
+                        worldShape, horizontalDistance, aboveShape.isEmpty())) {
+                    TrackedPoseRouteBuild active = TRACKED_POSE_BUILDS.get(transform.vehicleId);
+                    if (active != null) active.terrainContacts++;
+                    continue;
+                }
+                if (OBB.isColliding(prism, worldShape)) return block.immutable();
+            }
+        }
+        return null;
+    }
+
+    static boolean trackedTerrainContact(double entityY, double entityGroundOffset, AABB worldShape) {
+        double supportSurfaceY = entityY - entityGroundOffset;
+        return worldShape != null
+                && worldShape.minY <= supportSurfaceY + 0.035D
+                && worldShape.maxY <= supportSurfaceY + MAX_TRAVEL_STEP_HEIGHT + 0.035D;
+    }
+
+    /**
+     * A long tracked hull spans several stair-step blocks on a slope.  Relative to the centre
+     * support, its nose can legitimately touch terrain more than one block higher.  Treat the
+     * exposed top of a column as terrain inside a one-block-per-horizontal-block climb
+     * envelope.  A wall/tree remains blocking because its lower colliding column has another
+     * collision shape above it and therefore is not an exposed driving surface.
+     */
+    static boolean trackedExposedTerrainContact(double entityY, double entityGroundOffset, AABB worldShape,
+                                                double horizontalDistance, boolean exposedTop) {
+        if (worldShape == null || !exposedTop || !Double.isFinite(horizontalDistance)) return false;
+        double supportSurfaceY = entityY - entityGroundOffset;
+        double climbEnvelope = supportSurfaceY + MAX_TRAVEL_STEP_HEIGHT
+                + Math.max(0.0D, horizontalDistance) * MAX_TRAVEL_STEP_HEIGHT;
+        return worldShape.maxY <= climbEnvelope + 0.035D;
+    }
+
+    private static AABB trackedObbBounds(OBB obb) {
+        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY, minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
+        for (Vector3f vertex : obb.getVertices()) {
+            minX = Math.min(minX, vertex.x); minY = Math.min(minY, vertex.y); minZ = Math.min(minZ, vertex.z);
+            maxX = Math.max(maxX, vertex.x); maxY = Math.max(maxY, vertex.y); maxZ = Math.max(maxZ, vertex.z);
+        }
+        return new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+
+    /**
+     * Mirrors the native main-OBB contact rule when the AABB broad phase finds a block.
+     * The vehicle's physics deliberately ignores low samples on the four vertical faces so
+     * tracked hulls can climb/slide across curbs.  Treating those samples as hard walls made
+     * the route planner reject passages that the very same vehicle could drive through.
+     */
+    private static TrackedHullPoint trackedPoseBlockingContact(ServerLevel level, TrackedPoseTransform transform) {
+        for (TrackedHullPoint sample : transform.hull.samples) {
+            Vec3 world = transform.world(sample.local);
+            if (!level.getBlockState(BlockPos.containing(world)).isSolid()) continue;
+            if (trackedPoseContactBlocksMotion(transform.hull, sample)) return sample;
+        }
+        return null;
+    }
+
+    private static boolean trackedPoseContactBlocksMotion(TrackedHull hull, TrackedHullPoint sample) {
+        return switch (sample.face) {
+            // This is the exact height condition from PhysicsEngine.motionByImpact().
+            // Low side/front/back samples are track contact, not an impassable wall.
+            case LEFT, RIGHT, FRONT, BACK -> sample.local.y >= hull.lowSideContactY;
+            // Ground support is required separately; a bottom-face sample is not a blocker.
+            case BOTTOM -> false;
+            // A solid at the top sample is a real ceiling obstacle.
+            case TOP -> true;
+        };
+    }
+
+    private static int trackedPoseHeading(float yaw) {
+        return Math.floorMod(Math.round(yaw / (360.0F / TRACKED_POSE_HEADINGS)), TRACKED_POSE_HEADINGS);
+    }
+
+    private static float trackedPoseYaw(int heading) {
+        return Mth.wrapDegrees(heading * (360.0F / TRACKED_POSE_HEADINGS));
+    }
+
+    private static TrackedPoseKey trackedPoseKey(Vec3 anchor, Vec3 position, int heading) {
+        return new TrackedPoseKey((int) Math.round((position.x - anchor.x) / TRACKED_POSE_CELL),
+                (int) Math.round((position.z - anchor.z) / TRACKED_POSE_CELL), heading);
+    }
+
+    private static Vec3 trackedPosePosition(Vec3 anchor, TrackedPoseKey key, double y) {
+        return new Vec3(anchor.x + key.x * TRACKED_POSE_CELL, y, anchor.z + key.z * TRACKED_POSE_CELL);
+    }
+
     private static Vec3 navigationTarget(ServerPlayer player, Entity vehicle, Vec3 finalTarget, VehicleShape shape) {
         if (vehicle.getPersistentData().getBoolean(PATH_ASYNC_PENDING)) {
             // Route snapshots intentionally take several ticks.  Returning null here
             // makes move() call stopVehicle(), so a tracked vehicle near an open
             // house passage receives one steering tick and then waits for the whole
-            // async search.  It has native physical collision and can pivot in place;
-            // keep it making a short, bounded advance toward the safe target while
-            // the conservative grid search finishes in the background.
+            // async search.  Keep an orientation target instead: move() will replay
+            // an in-place pivot (or braking hold), never translation, until the result
+            // is based on the same physical position.
             Vec3 trackedAdvance = trackedAsyncProgressTarget(vehicle, finalTarget, shape);
             if (trackedAdvance != null) return trackedAdvance;
             return null;
@@ -1549,16 +2890,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (!isTrackedVehicle(vehicle) || finalTarget == null) return null;
         double distance = flatDistance(vehicle.position(), finalTarget);
         if (distance < 1.0E-6D) return null;
-        // Keep the temporary target close: normal tracked steering remains gentle,
-        // while a large close angle still uses the existing pivot-first branch.
+        // Keep the temporary orientation target close.  The pending-route branch in
+        // move() consumes it only for yaw and prevents translation.
         double advance = Mth.clamp(shape.radius() * 2.0D, 6.0D, 10.0D);
         return clippedTarget(vehicle.position(), finalTarget, advance);
     }
 
     private static boolean startAsyncRoute(Entity vehicle, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation) {
         if (ASYNC_ROUTES.containsKey(vehicle.getUUID())) return true;
-        int radius = Math.min(32, (int) Math.ceil(PATH_SEARCH_RADIUS / PATH_STEP));
         Vec3 start = vehicle.position();
+        int radius = Math.min(32, (int) Math.ceil(PATH_SEARCH_RADIUS / PATH_STEP));
         int gx = Mth.clamp((int) Math.round((safe.x - start.x) / PATH_STEP), -radius, radius);
         int gz = Mth.clamp((int) Math.round((safe.z - start.z) / PATH_STEP), -radius, radius);
         ASYNC_ROUTES.put(vehicle.getUUID(), new AsyncRouteBuild(start, safe, shape, ignored == null ? Set.of() : Set.copyOf(ignored), generation, radius, gx, gz));
@@ -1597,10 +2938,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             if (cell != null) route.add(new Vec3(build.start.x + point.x() * PATH_STEP, cell.y(), build.start.z + point.z() * PATH_STEP));
         }
         if (route.size() <= 1 || !validateAsyncRoute(vehicle, route, build.shape, build.ignored)) { data.putBoolean(PATH_BLOCKED, true); return; }
+        // The async solver deliberately works on a coarse, conservative grid.  Its raw
+        // result is a chain of every grid cell, not a route a vehicle should literally
+        // steer through.  Keeping that chain made a tracked hull follow needless large
+        // U-turns around a house even when two later points had a clear swept segment.
+        // Compress only by the same continuous collision sweep used at drive time, then
+        // validate again with the fleet's ignored-vehicle set before committing it.
+        int rawPoints = route.size();
+        route = simplifyRoute(vehicle, route, build.shape);
+        if (!validateAsyncRoute(vehicle, route, build.shape, build.ignored)) { data.putBoolean(PATH_BLOCKED, true); return; }
         if (flatDistance(route.get(route.size() - 1), build.safe) > 1.0D) route.add(build.safe);
         storeRoute(vehicle, build.safe, route, firstUsefulIndex(route, vehicle.position(), build.shape));
         refreshPlannedPath(player, vehicle, route);
-        pathDebug(vehicle, "ASYNC_ROUTE_APPLIED", "generation=%d cells=%d visited=%d points=%d", build.generation, build.cells.size(), result.visited(), route.size());
+        pathDebug(vehicle, "ASYNC_ROUTE_APPLIED", "generation=%d cells=%d visited=%d rawPoints=%d points=%d", build.generation, build.cells.size(), result.visited(), rawPoints, route.size());
     }
 
     private static boolean validateAsyncRoute(Entity vehicle, List<Vec3> route, VehicleShape shape, Set<UUID> ignored) {
@@ -1630,24 +2980,40 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 continue;
             }
             data.putInt(PATH_INDEX, index);
-            return routeLookaheadPoint(points, index, position, finalTarget, shape, speed);
+            return routeLookaheadPoint(vehicle, points, index, position, finalTarget, shape, speed);
         }
         clearRoute(vehicle);
         return finalTarget;
     }
 
-    private static Vec3 routeLookaheadPoint(ListTag points, int index, Vec3 position, Vec3 finalTarget, VehicleShape shape, double speed) {
+    private static Vec3 routeLookaheadPoint(Entity vehicle, ListTag points, int index, Vec3 position, Vec3 finalTarget, VehicleShape shape, double speed) {
         double lookahead = dynamicLookahead(speed, shape);
         Vec3 previous = position;
+        Vec3 lastVisible = null;
         double walked = 0.0D;
         for (int i = Math.max(1, index); i < points.size(); i++) {
             Vec3 point = readPathPoint(points.getCompound(i));
             if (point == null) break;
+            // A lookahead point is only a valid steering target when the vehicle can
+            // reach it directly from its *current* position.  Previously this method
+            // jumped several grid points ahead merely because their accumulated route
+            // distance was within lookahead.  At a house corner that cuts across the
+            // planned route, commands a broad pivot toward the far point, and drives
+            // the hull into the building the grid had just avoided.
+            double directDistance = Math.max(PATH_LOOKAHEAD_MIN, flatDistance(position, point) + shape.radius());
+            if (!canTravelDirect(vehicle, position, point, shape, directDistance)) break;
+            lastVisible = point;
             walked += flatDistance(previous, point);
             if (walked >= lookahead) return point;
             previous = point;
         }
-        return finalTarget;
+        // Never substitute the final destination after visibility was lost: that is
+        // exactly the same forbidden corner-cut at a much larger scale.  The nearest
+        // visible point keeps the hull inside the route; if no route point is currently
+        // visible, use the first point so ensureRoute can trigger its normal replan.
+        if (lastVisible != null) return lastVisible;
+        Vec3 first = index >= 0 && index < points.size() ? readPathPoint(points.getCompound(index)) : null;
+        return first != null ? first : finalTarget;
     }
 
     private static double routeCurvatureSpeedLimit(Entity vehicle, Vec3 currentTarget, double speed) {
@@ -1885,7 +3251,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     /** The asynchronous grid samples three horizontal blocks at a time. */
     static double terrainGridStepHeight() {
-        return PATH_STEP * MAX_TRAVEL_STEP_HEIGHT;
+        return terrainGridStepHeight(PATH_STEP);
+    }
+
+    static double terrainGridStepHeight(double gridStep) {
+        return gridStep * MAX_TRAVEL_STEP_HEIGHT;
     }
 
     private static boolean canOccupy(Entity vehicle, Vec3 position, VehicleShape shape, Set<UUID> ignoredVehicles) {
@@ -2096,6 +3466,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void clearRoute(Entity vehicle) {
         CompoundTag data = vehicle.getPersistentData();
+        TRACKED_POSE_ROUTES.remove(vehicle.getUUID());
+        TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+        TRACKED_RECOVERIES.remove(vehicle.getUUID());
+        TRACKED_MOTION_WATCHES.remove(vehicle.getUUID());
         data.remove(PATH_POINTS);
         data.remove(PATH_INDEX);
         data.remove(PATH_TARGET_X);
@@ -2743,7 +4117,26 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void alignMainWeaponsForward(Entity vehicle, boolean moving) {
         if (!moving) return;
-        Vec3 front = vehicle.position().add(vehicle.getLookAngle().multiply(24.0D, 0.0D, 24.0D));
+        alignMainWeaponsToYaw(vehicle, vehicle.getYRot(), true);
+    }
+
+    private static float trackedWeaponAimYaw(Entity vehicle, TrackedPoseRoute route,
+                                             TrackedPoseRouteBuild build, Vec3 fallbackTarget) {
+        if (route != null && route.index >= 0 && route.index < route.steps.size()) {
+            return route.steps.get(route.index).yaw;
+        }
+        Vec3 target = build != null ? build.commandTarget : fallbackTarget;
+        if (target != null) {
+            Vec3 horizontal = target.subtract(vehicle.position()).multiply(1.0D, 0.0D, 1.0D);
+            if (horizontal.lengthSqr() > 1.0E-6D) return yawTo(horizontal);
+        }
+        return vehicle.getYRot();
+    }
+
+    private static void alignMainWeaponsToYaw(Entity vehicle, float yaw, boolean active) {
+        if (!active) return;
+        Vec3 direction = Vec3.directionFromRotation(0.0F, yaw).multiply(1.0D, 0.0D, 1.0D).normalize();
+        Vec3 front = vehicle.position().add(direction.scale(24.0D));
         List<?> partUnits = asList(invokeNoArg(vehicle, "getPartUnits"));
         if (partUnits == null) return;
         for (Object partUnit : partUnits) alignWeaponTreeForward(vehicle, partUnit, front);
@@ -2768,9 +4161,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private record GroundControlState(boolean forward, boolean backward, boolean right, boolean left, boolean brake) {}
 
     private static void pathDebug(Entity vehicle, String phase, String format, Object... args) {
+        if (verbosePathPhase(phase) && !YwzjVehicleCompatConfig.pathTraceVerbose()) return;
         try {
             String message = args == null || args.length == 0 ? format : String.format(Locale.ROOT, format, args);
-            System.out.println(String.format(Locale.ROOT, "[DS-YWZJ-PATH] phase=%s vehicle=%s pos=%s yaw=%.1f speed=%.3f %s",
+            LOGGER.info("{}", String.format(Locale.ROOT, "[DS-YWZJ-PATH] phase=%s vehicle=%s pos=%s yaw=%.1f speed=%.3f %s",
                     phase,
                     vehicle == null ? "null" : vehicle.getStringUUID(),
                     vehicle == null ? "null" : fmt(vehicle.position()),
@@ -2779,6 +4173,22 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     message));
         } catch (RuntimeException ignored) {
         }
+    }
+
+    private static boolean verbosePathPhase(String phase) {
+        if (phase == null) return false;
+        return phase.equals("POSE_EXPAND")
+                || phase.startsWith("POSE_CANDIDATE_")
+                || phase.startsWith("POSE_NODE_")
+                || phase.startsWith("POSE_OCCUPY_")
+                || phase.startsWith("POSE_RESOLVE_")
+                || phase.startsWith("POSE_SWEEP_")
+                || phase.equals("POSE_ROUTE_STEP")
+                || phase.equals("POSE_SHORTCUT_KEEP")
+                || phase.equals("POSE_CONTROL_TICK")
+                || phase.equals("POSE_MOTION_WATCH")
+                || phase.startsWith("POSE_DEPENETRATE_CANDIDATE_")
+                || phase.equals("GROUND_TICK_CONTROL");
     }
 
     private static String fmt(Vec3 vec) {
@@ -3098,6 +4508,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return box == null ? "none" : String.format(Locale.ROOT, "%.2fx%.2fx%.2f", box.getXsize(), box.getYsize(), box.getZsize());
     }
 
+    private static String boxBounds(AABB box) {
+        return box == null ? "none" : String.format(Locale.ROOT, "[%.2f,%.2f,%.2f -> %.2f,%.2f,%.2f]",
+                box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ);
+    }
+
     private static AABB allComponentObbAabb(Entity vehicle) {
         AABB result = null;
         if (vehicle instanceof AbstractVehicle ywzjVehicle && ywzjVehicle.getVehicleCubeOBBs() != null) {
@@ -3233,6 +4648,301 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 if ((x == 0 && z == 0) || (x == goalX && z == goalZ)) continue;
                 points.add(new DominionAsyncGridPlanner.Point(x, z));
             }
+        }
+    }
+
+    private record TrackedPoseKey(int x, int z, int heading) {}
+    private record TrackedPoseCacheKey(int x2, int y2, int z2, int yaw5) {}
+
+    private record TrackedPose(Vec3 position, float yaw, boolean reverse) {}
+
+    private static final class TrackedPoseNode implements Comparable<TrackedPoseNode> {
+        final TrackedPoseKey key;
+        final Vec3 position;
+        final TrackedPoseNode parent;
+        final double cost;
+        final double priority;
+        final boolean reverse;
+
+        TrackedPoseNode(TrackedPoseKey key, Vec3 position, TrackedPoseNode parent,
+                        double cost, double priority, boolean reverse) {
+            this.key = key;
+            this.position = position;
+            this.parent = parent;
+            this.cost = cost;
+            this.priority = priority;
+            this.reverse = reverse;
+        }
+
+        @Override
+        public int compareTo(TrackedPoseNode other) {
+            return Double.compare(priority, other.priority);
+        }
+    }
+
+    private static final class TrackedPoseRouteBuild {
+        final Vec3 anchor;
+        final Vec3 target;
+        Vec3 commandTarget;
+        final TrackedHull hull;
+        final Set<UUID> ignored;
+        final long generation;
+        final float startYaw;
+        final double range;
+        final Map<TrackedPoseKey, Double> costs = new HashMap<>();
+        final Map<TrackedPoseCacheKey, Boolean> poseCache = new HashMap<>();
+        final PriorityQueue<TrackedPoseNode> open = new PriorityQueue<>();
+        final long startedTick;
+        long lastAdvanceTick = Long.MIN_VALUE;
+        long lastProgressTick;
+        long cpuNanos;
+        long poseTests;
+        long obbFallbacks;
+        long rejectedPoses;
+        long sweeps;
+        long cacheHits;
+        long convexRejects;
+        long terrainContacts;
+        TrackedPoseNode bestNode;
+        int expanded;
+
+        TrackedPoseRouteBuild(Vec3 start, float startYaw, Vec3 target, TrackedHull hull, Set<UUID> ignored,
+                              long generation, double range, long startedTick) {
+            this.anchor = start;
+            this.target = target;
+            this.commandTarget = target;
+            this.hull = hull;
+            this.ignored = ignored;
+            this.generation = generation;
+            this.startYaw = startYaw;
+            this.range = range;
+            this.startedTick = startedTick;
+            this.lastProgressTick = startedTick - 20L;
+            int heading = trackedPoseHeading(startYaw);
+            TrackedPoseKey startKey = new TrackedPoseKey(0, 0, heading);
+            TrackedPoseNode startNode = new TrackedPoseNode(startKey, start, null, 0.0D,
+                    flatDistance(start, target), false);
+            bestNode = startNode;
+            costs.put(startKey, 0.0D);
+            open.add(startNode);
+        }
+
+        boolean matches(Vec3 otherTarget) {
+            return otherTarget != null
+                    && flatDistanceSqr(target, otherTarget)
+                    <= TRACKED_POSE_TARGET_REUSE_RADIUS * TRACKED_POSE_TARGET_REUSE_RADIUS;
+        }
+
+        boolean matchesFinalTarget(CompoundTag data) {
+            if (data.getLong(PATH_GENERATION) != generation || !data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)) return false;
+            double x = data.getDouble(FINAL_TARGET_X), z = data.getDouble(FINAL_TARGET_Z);
+            return (x - target.x) * (x - target.x) + (z - target.z) * (z - target.z) <= 4.0D;
+        }
+
+        boolean inRange(Vec3 position) {
+            return flatDistance(anchor, position) <= range;
+        }
+    }
+
+    private static final class TrackedPoseRoute {
+        final Vec3 target;
+        final Vec3 safe;
+        final long generation;
+        final TrackedHull hull;
+        final List<TrackedPose> steps;
+        int index;
+        boolean stopRequested;
+        boolean replanAfterStop;
+
+        TrackedPoseRoute(Vec3 target, Vec3 safe, long generation, TrackedHull hull, List<TrackedPose> steps) {
+            this.target = target;
+            this.safe = safe;
+            this.generation = generation;
+            this.hull = hull;
+            this.steps = List.copyOf(steps);
+            this.index = Math.min(1, Math.max(0, this.steps.size() - 1));
+        }
+
+        boolean matches(Vec3 otherTarget) {
+            return otherTarget != null && flatDistanceSqr(target, otherTarget) <= 4.0D;
+        }
+
+        TrackedHull hull() {
+            return hull;
+        }
+    }
+
+    private static final class TrackedRecovery {
+        final Vec3 start;
+        final Vec3 target;
+        final TrackedHull hull;
+        Vec3 reverseOrigin;
+        long lastTick = Long.MIN_VALUE;
+        int ticks;
+        int reverseTicks;
+        boolean brakingBeforeReverse = true;
+        boolean brakingAfterReverse;
+
+        TrackedRecovery(Vec3 start, Vec3 target, TrackedHull hull) {
+            this.start = start;
+            this.target = target;
+            this.hull = hull;
+            this.reverseOrigin = start;
+        }
+    }
+
+    private static final class TrackedMotionWatch {
+        Vec3 lastPosition;
+        float lastYaw;
+        long lastTick;
+        int stalledTicks;
+
+        TrackedMotionWatch(Vec3 lastPosition, float lastYaw, long lastTick) {
+            this.lastPosition = lastPosition;
+            this.lastYaw = lastYaw;
+            this.lastTick = lastTick;
+        }
+    }
+
+    private record TrackedHullPoint(Vector3f local, VehicleCubeOBB.CubeFace face) {}
+
+    /** Immutable main-OBB geometry captured before the incremental pose search begins. */
+    private static final class TrackedHull {
+        final List<TrackedHullPoint> samples;
+        final Vector3f centerLocal;
+        final Quaternionf localObbRotation;
+        final Vector3f extents;
+        final double lowSideContactY;
+        final double entityGroundOffset;
+
+        TrackedHull(List<TrackedHullPoint> samples, Vector3f centerLocal, Quaternionf localObbRotation, Vector3f extents,
+                    double lowSideContactY, double entityGroundOffset) {
+            this.samples = samples;
+            this.centerLocal = centerLocal;
+            this.localObbRotation = localObbRotation;
+            this.extents = extents;
+            this.lowSideContactY = lowSideContactY;
+            this.entityGroundOffset = entityGroundOffset;
+        }
+
+        static TrackedHull from(AbstractVehicle vehicle) {
+            VehicleCubeOBB cube = vehicle.getMainCubeOBB();
+            if (cube == null || cube.obb() == null || cube.cubePoints() == null || cube.cubePoints().isEmpty()) return null;
+            Quaternionf vehicleRotation = new Quaternionf(vehicle.rotYXZ());
+            Quaternionf inverse = new Quaternionf(vehicleRotation).invert();
+            Quaternionf localRotation = new Quaternionf(inverse).mul(new Quaternionf(cube.obb().rotation()));
+            Vec3 vehicleCenter = vehicle.position().add(vehicle.centerOffset == null ? Vec3.ZERO : vehicle.centerOffset);
+            Vector3f centerLocal = new Vector3f(cube.obb().center()).sub(vehicleCenter.toVector3f());
+            inverse.transform(centerLocal);
+            List<TrackedHullPoint> samples = new ArrayList<>();
+            for (VehicleCubeOBB.CubePoint point : cube.cubePoints()) {
+                samples.add(new TrackedHullPoint(new Vector3f(point.obbLocalPos()), point.cubeFace()));
+            }
+            // PhysicsEngine ignores a vertical-face sample below this local height before
+            // deciding whether it is a collision.  Capture it with the immutable pose hull so
+            // planning and native driving agree even when the model has a non-default spaceY.
+            double lowSideContactY = -cube.getHeight() / 2.0D + cube.spaceY;
+            double entityGroundOffset = trackedEntityGroundOffset(vehicle, cube);
+            return new TrackedHull(List.copyOf(samples), centerLocal, localRotation,
+                    new Vector3f(cube.obb().extents()), lowSideContactY, entityGroundOffset);
+        }
+
+        private static double trackedEntityGroundOffset(AbstractVehicle vehicle, VehicleCubeOBB cube) {
+            // This offset is a property of the model, not of the block currently under the
+            // entity centre.  The old terrain scan returned 0.7-1.0 blocks while a long tank
+            // bridged a slope or a single rock.  Every hypothetical pose was then raised by
+            // that amount, its support plane was lowered by the same amount, and an otherwise
+            // clear straight road became an "embedded" one-node search.
+            //
+            // Undo the live vehicle pitch/roll on every physical OBB vertex and measure the
+            // canonical flat hull bottom relative to the entity origin.  Yaw cannot affect Y,
+            // so this value stays invariant on slopes and uneven ground.
+            Quaternionf inverseVehicleRotation = new Quaternionf(vehicle.rotYXZ()).invert();
+            Vec3 centerOffset = vehicle.centerOffset == null ? Vec3.ZERO : vehicle.centerOffset;
+            Vec3 vehicleCenter = vehicle.position().add(centerOffset);
+            double flatBottomRelativeToEntity = Double.POSITIVE_INFINITY;
+            for (Vector3f vertex : cube.obb().getVertices()) {
+                Vector3f local = new Vector3f(vertex).sub(vehicleCenter.toVector3f());
+                inverseVehicleRotation.transform(local);
+                flatBottomRelativeToEntity = Math.min(flatBottomRelativeToEntity, centerOffset.y + local.y);
+            }
+            double offset = -flatBottomRelativeToEntity;
+            return Double.isFinite(offset) ? offset : 0.0D;
+        }
+
+        TrackedPoseTransform transform(AbstractVehicle vehicle, Vec3 position, float yaw) {
+            // Navigation is deliberately 2.5D.  A tracked hull's live pitch/roll describe its
+            // *current* suspension contact with one particular slope; carrying those angles
+            // into every hypothetical A* node makes a long tilted hull cut into otherwise flat
+            // ground and disconnects the entire search graph.  Candidate Y plus the traversable
+            // terrain band model grade changes; native YWZJ physics supplies the real pitch and
+            // roll while the vehicle drives the accepted route.
+            Quaternionf vehicleRotation = trackedPlanningRotation(yaw);
+            Quaternionf obbRotation = new Quaternionf(vehicleRotation).mul(new Quaternionf(localObbRotation));
+            Vector3f offset = new Vector3f(centerLocal);
+            vehicleRotation.transform(offset);
+            Vec3 centerBase = position.add(vehicle.centerOffset == null ? Vec3.ZERO : vehicle.centerOffset);
+            Vector3f center = centerBase.add(offset.x, offset.y, offset.z).toVector3f();
+            double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY, minZ = Double.POSITIVE_INFINITY;
+            double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY, maxZ = Double.NEGATIVE_INFINITY;
+            for (TrackedHullPoint sample : samples) {
+                Vector3f point = new Vector3f(sample.local);
+                obbRotation.transform(point).add(center);
+                minX = Math.min(minX, point.x); minY = Math.min(minY, point.y); minZ = Math.min(minZ, point.z);
+                maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y); maxZ = Math.max(maxZ, point.z);
+            }
+            return new TrackedPoseTransform(this, vehicle.getUUID(), position.y, center, obbRotation,
+                    new AABB(minX, minY, minZ, maxX, maxY, maxZ));
+        }
+    }
+
+    static Quaternionf trackedPlanningRotation(float yaw) {
+        return new Quaternionf().rotateY((float) Math.toRadians(-yaw));
+    }
+
+    private static final class TrackedPoseTransform {
+        final TrackedHull hull;
+        final UUID vehicleId;
+        final double entityY;
+        final Vector3f center;
+        final Quaternionf rotation;
+        final AABB bounds;
+
+        TrackedPoseTransform(TrackedHull hull, UUID vehicleId, double entityY,
+                             Vector3f center, Quaternionf rotation, AABB bounds) {
+            this.hull = hull;
+            this.vehicleId = vehicleId;
+            this.entityY = entityY;
+            this.center = center;
+            this.rotation = rotation;
+            this.bounds = bounds;
+        }
+
+        Vec3 world(Vector3f local) {
+            Vector3f point = new Vector3f(local);
+            rotation.transform(point).add(center);
+            return new Vec3(point.x, point.y, point.z);
+        }
+
+        OBB navigationPrism() {
+            // Native physics ignores vertical-face samples below lowSideContactY.  Trim that
+            // track/curb region out of the planner prism instead of treating the ground as a
+            // wall.  Small insets avoid classifying mathematical face-touching as penetration.
+            float bottom = (float) Math.max(-hull.extents.y + 0.035D, hull.lowSideContactY + 0.035D);
+            float top = hull.extents.y - 0.035F;
+            if (top <= bottom) top = bottom + 0.05F;
+            float localCenterY = (bottom + top) * 0.5F;
+            Vector3f shiftedCenter = new Vector3f(0.0F, localCenterY, 0.0F);
+            rotation.transform(shiftedCenter).add(center);
+            Vector3f prismExtents = new Vector3f(
+                    Math.max(0.05F, hull.extents.x - 0.035F),
+                    Math.max(0.025F, (top - bottom) * 0.5F),
+                    Math.max(0.05F, hull.extents.z - 0.035F));
+            return new OBB(shiftedCenter, prismExtents, new Quaternionf(rotation));
+        }
+
+        AABB bounds() {
+            return bounds;
         }
     }
 

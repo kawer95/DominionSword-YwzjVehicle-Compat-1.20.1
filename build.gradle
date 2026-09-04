@@ -2,6 +2,7 @@ plugins {
     id 'eclipse'
     id 'idea'
     id 'net.minecraftforge.gradle' version '6.0.54'
+    id 'org.spongepowered.mixin' version '0.7.+'
 }
 
 group = mod_group_id
@@ -28,6 +29,7 @@ repositories { mavenCentral() }
 
 dependencies {
     minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
@@ -41,6 +43,11 @@ dependencies {
     testImplementation files(project.property('ywzj_vehicle_jar'))
 }
 
+mixin {
+    add sourceSets.main, 'dominionsword_ywzjvehicle_compat.refmap.json'
+    config 'dominionsword_ywzjvehicle_compat.mixins.json'
+}
+
 tasks.named('processResources', ProcessResources).configure {
     filteringCharset = 'UTF-8'
     def props = [minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
@@ -52,7 +59,10 @@ tasks.named('processResources', ProcessResources).configure {
     filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) { expand props + [project: project] }
 }
 
-tasks.named('jar', Jar).configure { finalizedBy 'reobfJar' }
+tasks.named('jar', Jar).configure {
+    manifest { attributes 'MixinConfigs': 'dominionsword_ywzjvehicle_compat.mixins.json' }
+    finalizedBy 'reobfJar'
+}
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.withType(Test).configureEach { useJUnitPlatform() }
 

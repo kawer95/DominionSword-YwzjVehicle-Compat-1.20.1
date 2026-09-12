@@ -455,6 +455,45 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     @Override
+    public boolean supportsPlayerBoarding(ServerPlayer player, Entity vehicle, int seat) {
+        return player != null && player.isAlive() && supports(vehicle) && seat >= 0
+                && seats(vehicle).stream().anyMatch(view -> view.index() == seat);
+    }
+
+    @Override
+    public boolean boardPlayer(ServerPlayer player, Entity vehicle, int seat, boolean force) {
+        if (!supportsPlayerBoarding(player, vehicle, seat)) return false;
+        SeatView requested = seats(vehicle).stream().filter(view -> view.index() == seat).findFirst().orElse(null);
+        if (requested == null) return false;
+        Entity occupant = requested.passenger();
+        if (occupant != null && occupant != player) {
+            if (!force || !com.arxyt.dominionsword.api.VehicleDismounts.dismount(vehicle, occupant)) return false;
+        }
+        if (player.getVehicle() != vehicle && !player.startRiding(vehicle, true)) return false;
+        Object changed = invoke(vehicle, "changeSeat", new Class<?>[]{LivingEntity.class, int.class}, player, seat);
+        if (seat == 0) {
+            AbstractVehicle ywzjVehicle = (AbstractVehicle) vehicle;
+            ywzjVehicle.toggleEngine(Boolean.TRUE);
+            ywzjVehicle.controlUnit.setOperator(player);
+        }
+        return player.getVehicle() == vehicle && (Boolean.TRUE.equals(changed) || seatPassenger(vehicle, seat) == player);
+    }
+
+    @Override
+    public Vec3 playerBoardingPosition(ServerPlayer player, Entity vehicle) {
+        AABB box = selectionBounds(vehicle).inflate(1.25D, 0.0D, 1.25D);
+        return new Vec3(Mth.clamp(player.getX(), box.minX, box.maxX), vehicle.getY(),
+                Mth.clamp(player.getZ(), box.minZ, box.maxZ));
+    }
+
+    @Override
+    public boolean canPlayerBoardFrom(ServerPlayer player, Entity vehicle) {
+        AABB box = selectionBounds(vehicle).inflate(1.35D, 0.75D, 1.35D);
+        return player.getBoundingBox().inflate(0.45D).intersects(box)
+                || player.distanceToSqr(playerBoardingPosition(player, vehicle)) <= 6.25D;
+    }
+
+    @Override
     public Vec3 boardingPosition(Mob unit, Entity vehicle) {
         AABB box = selectionBounds(vehicle).inflate(1.25D, 0.0D, 1.25D);
         double x = Mth.clamp(unit.getX(), box.minX, box.maxX);

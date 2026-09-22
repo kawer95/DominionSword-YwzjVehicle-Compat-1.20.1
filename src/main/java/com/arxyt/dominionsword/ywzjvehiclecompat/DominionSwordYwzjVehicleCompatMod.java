@@ -18,6 +18,7 @@ public final class DominionSwordYwzjVehicleCompatMod {
         ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, YwzjVehicleCompatConfig.SPEC);
         DominionVehicleAdapters.register(vehicleAdapter);
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
+        MinecraftForge.EVENT_BUS.addListener((net.minecraftforge.event.server.ServerStoppedEvent event) -> YwzjVehicleAdapter.clearPlanning());
         MinecraftForge.EVENT_BUS.addListener(this::onEntityJoin);
         MinecraftForge.EVENT_BUS.addListener(this::onEntityLeave);
     }

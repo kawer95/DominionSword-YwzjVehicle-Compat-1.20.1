@@ -3,6 +3,7 @@ package com.arxyt.dominionsword.ywzjvehiclecompat;
 import com.arxyt.dominionsword.api.DominionControlApi;
 import com.arxyt.dominionsword.api.DominionVehicleAdapter;
 import com.arxyt.dominionsword.api.DominionAsyncGridPlanner;
+import com.arxyt.dominionsword.api.DominionPathBudget;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
@@ -249,6 +250,25 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     @Override
     public int priority() {
         return 50;
+    }
+
+    @Override
+    public com.arxyt.dominionsword.api.DominionGroundProfile groundProfile(Entity vehicle) {
+        if (!isTrackedVehicle(vehicle) && !classNameContains(vehicle, ".WheeledVehicle")) return null;
+        VehicleShape shape = VehicleShape.from(vehicle);
+        return new com.arxyt.dominionsword.api.DominionGroundProfile(isTrackedVehicle(vehicle)
+                ? com.arxyt.dominionsword.api.DominionGroundProfile.Kind.TRACKED
+                : com.arxyt.dominionsword.api.DominionGroundProfile.Kind.WHEELED,
+                shape.radius()*2, Math.max(1,shape.maxYOffset-shape.minYOffset),1,1,
+                isTrackedVehicle(vehicle) ? 0 : estimatedTurnRadius(vehicle,shape));
+    }
+    @Override public void holdGroundRoute(Entity vehicle) {
+        unregisterActiveGroundControl(vehicle);
+        if (vehicle instanceof AbstractVehicle chassis) {
+            GroundControlState control = isTrackedVehicle(vehicle) ? trackedBrakeControl(vehicle)
+                    : new GroundControlState(false,false,false,false,true);
+            writeControl(chassis,control.forward(),control.backward(),control.right(),control.left(),control.brake());
+        }
     }
 
     @Override
@@ -1290,6 +1310,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             ensureTrackedPoseRoute(player, vehicle, target, shape);
             return;
         }
+        if (data.getBoolean(PATH_ASYNC_PENDING) && !hasActiveRoute(vehicle,target)) {
+            AsyncRouteBuild old = ASYNC_ROUTES.remove(vehicle.getUUID());
+            if (old != null && old.future != null) old.future.cancel(false);
+            data.remove(PATH_ASYNC_PENDING); clearRoute(vehicle);
+        }
         if (data.getBoolean(PATH_ASYNC_PENDING)) {
             advanceAsyncRoute(player, vehicle, target, Set.of(vehicle.getUUID()));
             return;
@@ -1637,7 +1662,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             else {
                 route = simplifyRoute(vehicle, route, shape);
                 LagTrace.mark("simplify:size=" + route.size());
-                if (flatDistance(route.get(route.size() - 1), safe) > 1.0D) {
+                if (flatDistance(route.get(route.size() - 1), safe) > 1.0D
+                            && canSweep(vehicle, route.get(route.size() - 1), safe, shape, ignoredVehicles)) {
                     List<Vec3> appended = new ArrayList<>(route);
                     appended.add(safe);
                     route = appended;
@@ -1793,6 +1819,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void advanceTrackedPoseRoute(ServerPlayer player, Entity vehicle, TrackedPoseRouteBuild build) {
+        try (DominionPathBudget.Scope planningBudget = DominionPathBudget.acquire(vehicle.getServer(), vehicle.getServer().getTickCount(), vehicle.getUUID().toString() + ":pose")) {
+            if (planningBudget == null) return;
+
         CompoundTag data = vehicle.getPersistentData();
         if (!build.matchesFinalTarget(data) || !(vehicle instanceof AbstractVehicle)) {
             TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
@@ -1808,7 +1837,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         long deadline = sliceStart + TRACKED_POSE_SEARCH_BUDGET_NANOS;
         int budget = TRACKED_POSE_EXPANSIONS_PER_TICK;
         int expandedThisTick = 0;
-        while (budget-- > 0 && (expandedThisTick == 0 || System.nanoTime() < deadline)) {
+        while (budget-- > 0 && (expandedThisTick == 0 || System.nanoTime() < deadline) && planningBudget.step()) {
             TrackedPoseNode node = build.open.poll();
             if (node == null) {
                 build.cpuNanos += System.nanoTime() - sliceStart;
@@ -1865,6 +1894,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     expandedThisTick, build.expanded, build.open.size(), build.poseTests,
                     build.cacheHits, build.obbFallbacks, build.terrainContacts, build.convexRejects,
                     build.rejectedPoses, build.sweeps);
+        }
+
         }
     }
 
@@ -2936,7 +2967,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static boolean startAsyncRoute(Entity vehicle, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation) {
-        if (ASYNC_ROUTES.containsKey(vehicle.getUUID())) return true;
+        AsyncRouteBuild previous = ASYNC_ROUTES.get(vehicle.getUUID());
+        if (previous != null && previous.generation == generation) return true;
+        if (previous != null && previous.future != null) previous.future.cancel(false);
+        ASYNC_ROUTES.remove(vehicle.getUUID());
         Vec3 start = vehicle.position();
         int radius = Math.min(32, (int) Math.ceil(PATH_SEARCH_RADIUS / PATH_STEP));
         int gx = Mth.clamp((int) Math.round((safe.x - start.x) / PATH_STEP), -radius, radius);
@@ -2946,12 +2980,15 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void advanceAsyncRoute(ServerPlayer player, Entity vehicle, Vec3 target, Set<UUID> ignored) {
+        try (DominionPathBudget.Scope planningBudget = DominionPathBudget.acquire(vehicle.getServer(), vehicle.getServer().getTickCount(), vehicle.getUUID().toString() + ":snapshot")) {
+            if (planningBudget == null) return;
+
         AsyncRouteBuild build = ASYNC_ROUTES.get(vehicle.getUUID());
         CompoundTag data = vehicle.getPersistentData();
         if (build == null || build.generation != data.getLong(PATH_GENERATION)) { data.remove(PATH_ASYNC_PENDING); return; }
         if (build.future == null) {
             int budget = ASYNC_SNAPSHOT_CELLS_PER_TICK;
-            while (budget-- > 0 && build.cursor < build.points.size()) {
+            while (budget-- > 0 && build.cursor < Math.min(build.sampleLimit, build.points.size()) && planningBudget.step()) {
                 DominionAsyncGridPlanner.Point point = build.points.get(build.cursor++);
                 Vec3 raw = build.start.add(point.x() * PATH_STEP, 0.0D, point.z() * PATH_STEP);
                 Vec3 occupy = occupiableNear(vehicle, raw, build.shape, build.ignored);
@@ -2960,36 +2997,50 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     build.cells.put(point.key(), new DominionAsyncGridPlanner.Cell(occupy.y, penalty));
                 }
             }
-            if (build.cursor < build.points.size()) return;
+            if (build.cursor < Math.min(build.sampleLimit, build.points.size())) return;
             DominionAsyncGridPlanner.Point startPoint = new DominionAsyncGridPlanner.Point(0, 0);
             DominionAsyncGridPlanner.Point goalPoint = new DominionAsyncGridPlanner.Point(build.goalX, build.goalZ);
+            if (!planningBudget.step()) return;
             build.future = DominionAsyncGridPlanner.submit(new DominionAsyncGridPlanner.Snapshot(startPoint, goalPoint, Map.copyOf(build.cells), PATH_MAX_ITERATIONS, terrainGridStepHeight(), 2.0D));
             return;
         }
         if (!build.future.isDone()) return;
         DominionAsyncGridPlanner.Result result = build.future.getNow(null);
-        ASYNC_ROUTES.remove(vehicle.getUUID());
-        data.remove(PATH_ASYNC_PENDING);
-        if (result == null || !result.found()) { data.putBoolean(PATH_BLOCKED, true); return; }
-        List<Vec3> route = new ArrayList<>();
-        for (DominionAsyncGridPlanner.Point point : result.points()) {
-            DominionAsyncGridPlanner.Cell cell = build.cells.get(point.key());
-            if (cell != null) route.add(new Vec3(build.start.x + point.x() * PATH_STEP, cell.y(), build.start.z + point.z() * PATH_STEP));
+        if ((result == null || !result.found()) && build.sampleLimit < build.points.size()) {
+            build.sampleLimit = com.arxyt.dominionsword.api.DominionRouteSampling.nextLimit(build.sampleLimit, build.points.size());
+            build.future = null;
+            return;
         }
-        if (route.size() <= 1 || !validateAsyncRoute(vehicle, route, build.shape, build.ignored)) { data.putBoolean(PATH_BLOCKED, true); return; }
-        // The async solver deliberately works on a coarse, conservative grid.  Its raw
-        // result is a chain of every grid cell, not a route a vehicle should literally
-        // steer through.  Keeping that chain made a tracked hull follow needless large
-        // U-turns around a house even when two later points had a clear swept segment.
-        // Compress only by the same continuous collision sweep used at drive time, then
-        // validate again with the fleet's ignored-vehicle set before committing it.
-        int rawPoints = route.size();
-        route = simplifyRoute(vehicle, route, build.shape);
-        if (!validateAsyncRoute(vehicle, route, build.shape, build.ignored)) { data.putBoolean(PATH_BLOCKED, true); return; }
-        if (flatDistance(route.get(route.size() - 1), build.safe) > 1.0D) route.add(build.safe);
-        storeRoute(vehicle, build.safe, route, firstUsefulIndex(route, vehicle.position(), build.shape));
-        refreshPlannedPath(player, vehicle, route);
-        pathDebug(vehicle, "ASYNC_ROUTE_APPLIED", "generation=%d cells=%d visited=%d rawPoints=%d points=%d", build.generation, build.cells.size(), result.visited(), rawPoints, route.size());
+        if (result == null || !result.usable()) {
+            ASYNC_ROUTES.remove(vehicle.getUUID()); data.remove(PATH_ASYNC_PENDING); data.putBoolean(PATH_BLOCKED, true); return;
+        }
+        if (build.candidate == null) {
+            build.candidate = new ArrayList<>();
+            for (DominionAsyncGridPlanner.Point point : result.points()) {
+                DominionAsyncGridPlanner.Cell cell = build.cells.get(point.key());
+                if (cell != null) build.candidate.add(new Vec3(build.start.x + point.x()*PATH_STEP,cell.y(),build.start.z + point.z()*PATH_STEP));
+            }
+            // Append only a short final connection; it goes through the same incremental validation.
+            Vec3 last = build.candidate.get(build.candidate.size()-1);
+            if (last.distanceToSqr(build.safe) <= 36 && last.distanceToSqr(build.safe) > .01) build.candidate.add(build.safe);
+        }
+        while (build.validated < build.candidate.size()) {
+            if (!planningBudget.step()) return;
+            Vec3 from=build.candidate.get(build.validated-1), to=build.candidate.get(build.validated);
+            if (!canSweep(vehicle, from, to, build.shape, build.ignored)) {
+                // A rejected exact-end connector leaves a valid partial path; an interior rejection invalidates it.
+                if (build.validated == build.candidate.size()-1 && to.equals(build.safe) && build.validated > 1) {
+                    build.candidate.remove(build.validated); break;
+                }
+                ASYNC_ROUTES.remove(vehicle.getUUID()); data.remove(PATH_ASYNC_PENDING); data.putBoolean(PATH_BLOCKED, true); return;
+            }
+            build.validated++;
+        }
+        ASYNC_ROUTES.remove(vehicle.getUUID()); data.remove(PATH_ASYNC_PENDING);
+        storeRoute(vehicle, build.safe, build.candidate, firstUsefulIndex(build.candidate, vehicle.position(), build.shape));
+        refreshPlannedPath(player, vehicle, build.candidate);
+
+        }
     }
 
     private static boolean validateAsyncRoute(Entity vehicle, List<Vec3> route, VehicleShape shape, Set<UUID> ignored) {
@@ -3022,7 +3073,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return routeLookaheadPoint(vehicle, points, index, position, finalTarget, shape, speed);
         }
         clearRoute(vehicle);
-        return finalTarget;
+        if (flatDistance(position, finalTarget) <= Math.max(6,shape.radius()*2)
+                && canSweep(vehicle,position,finalTarget,shape,Set.of(vehicle.getUUID()))) return finalTarget;
+        data.putBoolean(PATH_BLOCKED,true);
+        return null;
     }
 
     private static Vec3 routeLookaheadPoint(Entity vehicle, ListTag points, int index, Vec3 position, Vec3 finalTarget, VehicleShape shape, double speed) {
@@ -3079,6 +3133,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static List<Vec3> findAvoidancePath(Entity vehicle, Vec3 start, Vec3 target, VehicleShape shape, Set<UUID> ignoredVehicles) {
+        try (DominionPathBudget.Scope planningBudget = DominionPathBudget.acquire(vehicle.getServer(), vehicle.getServer().getTickCount(), vehicle.getUUID().toString() + ":local")) {
+            if (planningBudget == null) return List.of();
+
         try (LagTrace ignoredTrace = LagTrace.start("ywzj.route.astar", "vehicle=" + vehicle.getId())) {
         Vec3 startPos = occupiableNear(vehicle, start, shape, ignoredVehicles);
         Vec3 targetPos = occupiableNear(vehicle, target, shape, ignoredVehicles);
@@ -3099,7 +3156,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         open.add(new PathState(startNode, 0.0D, bestH));
         cost.put(startNode, 0.0D);
         int iterations = 0;
-        while (!open.isEmpty() && iterations++ < PATH_MAX_ITERATIONS) {
+        while (!open.isEmpty() && iterations++ < PATH_MAX_ITERATIONS && planningBudget.step()) {
             PathState currentState = open.poll();
             AvoidNode current = currentState.node();
             if (!closed.add(current)) continue;
@@ -3151,6 +3208,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (flatDistance(last, targetPos) > 1.0D && canSweep(vehicle, last, targetPos, shape, ignoredVehicles)) route.add(targetPos);
         LagTrace.mark("astar_route:iterations=" + iterations + ":points=" + route.size());
         return route;
+        }
+
         }
     }
 
@@ -4668,6 +4727,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private record TrackSafetyKey(UUID vehicle, int x, int z, int radius) {}
     private record CachedTrackSafety(boolean safe, long expiresAt) {}
 
+    static void clearPlanning() {
+        ASYNC_ROUTES.values().forEach(build -> { if (build.future != null) build.future.cancel(false); });
+        ASYNC_ROUTES.clear();
+        TRACKED_POSE_BUILDS.clear(); TRACKED_POSE_ROUTES.clear(); TRACKED_RECOVERIES.clear();
+    }
+
     private static final class AsyncRouteBuild {
         final Vec3 start, safe;
         final VehicleShape shape;
@@ -4677,6 +4742,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         final List<DominionAsyncGridPlanner.Point> points = new ArrayList<>();
         final Map<Long, DominionAsyncGridPlanner.Cell> cells = new HashMap<>();
         int cursor;
+        int sampleLimit = 128;
+        List<Vec3> candidate;
+        int validated = 1;
         CompletableFuture<DominionAsyncGridPlanner.Result> future;
 
         AsyncRouteBuild(Vec3 start, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation, int radius, int goalX, int goalZ) {
@@ -4687,6 +4755,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 if ((x == 0 && z == 0) || (x == goalX && z == goalZ)) continue;
                 points.add(new DominionAsyncGridPlanner.Point(x, z));
             }
+            points.sort(Comparator.comparingDouble(p -> com.arxyt.dominionsword.api.DominionRouteSampling.priority(p.x(), p.z(), goalX, goalZ)));
         }
     }
 

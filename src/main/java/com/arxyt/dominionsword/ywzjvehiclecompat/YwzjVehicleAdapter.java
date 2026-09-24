@@ -253,14 +253,44 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     @Override public List<Vec3> marchRoute(ServerPlayer player,Entity vehicle,Vec3 target) {
+        if(vehicle==null || target==null)return List.of();
         ensureRoute(player,vehicle,target,VehicleShape.from(vehicle));
         if(isTrackedVehicle(vehicle)) {
             TrackedPoseRoute route=TRACKED_POSE_ROUTES.get(vehicle.getUUID());
-            return route!=null && route.matches(target) ? route.steps.stream().map(TrackedPose::position).toList() : List.of();
+            if(route!=null && route.matches(target) && !route.steps.isEmpty()
+                    && flatDistance(route.safe,target)>TRACKED_POSE_GOAL_RADIUS+0.25D) {
+                TrackedPose end=route.steps.get(route.steps.size()-1);
+                if(route.index>=route.steps.size() || route.index==route.steps.size()-1
+                        && flatDistance(vehicle.position(),end.position)<=TRACKED_POSE_REACH_RADIUS
+                        && Math.abs(Mth.wrapDegrees(end.yaw-vehicle.getYRot()))<=TRACKED_POSE_YAW_TOLERANCE) {
+                    invalidateTrackedPoseRoute(vehicle,target,"march_partial_complete");
+                    ensureRoute(player,vehicle,target,VehicleShape.from(vehicle));
+                    route=TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+                }
+            }
+            if(route==null || !route.matches(target) || TRACKED_POSE_BUILDS.containsKey(vehicle.getUUID())
+                    || vehicle.getPersistentData().getBoolean(PATH_BLOCKED))return List.of();
+            int index=Math.max(1,route.index);
+            if(index>=route.steps.size())return List.of();
+            List<Vec3> remaining=new ArrayList<>();
+            remaining.add(vehicle.position());
+            for(int i=index;i<route.steps.size();i++)remaining.add(route.steps.get(i).position());
+            return remaining.get(remaining.size()-1).distanceToSqr(vehicle.position())>.01D ? remaining : List.of();
         }
         CompoundTag tag=vehicle.getPersistentData();
-        if(tag.getBoolean(PATH_ASYNC_PENDING) || tag.getBoolean(PATH_BLOCKED) || !tag.contains(PATH_POINTS,Tag.TAG_LIST))return List.of();
-        return storedRoute(vehicle,target);
+        if(tag.getBoolean(PATH_ASYNC_PENDING) || tag.getBoolean(PATH_BLOCKED)
+                || !hasActiveRoute(vehicle,target) || !tag.contains(PATH_POINTS,Tag.TAG_LIST))return List.of();
+        ListTag points=tag.getList(PATH_POINTS,Tag.TAG_COMPOUND);
+        int index=Math.max(1,tag.getInt(PATH_INDEX));
+        if(index>=points.size())return List.of();
+        List<Vec3> remaining=new ArrayList<>();
+        remaining.add(vehicle.position());
+        for(int i=index;i<points.size();i++) {
+            Vec3 point=readPathPoint(points.getCompound(i));
+            if(point==null)return List.of();
+            remaining.add(point);
+        }
+        return remaining.get(remaining.size()-1).distanceToSqr(vehicle.position())>.01D ? remaining : List.of();
     }
 
     @Override

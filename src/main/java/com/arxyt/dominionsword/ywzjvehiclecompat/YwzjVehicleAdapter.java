@@ -2,8 +2,9 @@ package com.arxyt.dominionsword.ywzjvehiclecompat;
 
 import com.arxyt.dominionsword.api.DominionControlApi;
 import com.arxyt.dominionsword.api.DominionVehicleAdapter;
-import com.arxyt.dominionsword.api.DominionAsyncGridPlanner;
+import com.arxyt.dominionsword.api.DominionFrontierPlanner;
 import com.arxyt.dominionsword.api.DominionPathBudget;
+import com.arxyt.dominionsword.api.DominionGroundTransitionPolicy;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
@@ -47,7 +48,6 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CompletableFuture;
 import org.slf4j.Logger;
 import org.ywzj.vehicle.entity.vehicle.AbstractVehicle;
 import org.ywzj.vehicle.entity.vehicle.FixedWingVehicle;
@@ -146,6 +146,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String SAFE_TARGET_Y = "DominionSwordYwzjSafeTargetY";
     private static final String SAFE_TARGET_Z = "DominionSwordYwzjSafeTargetZ";
     private static final String FINAL_TARGET_X = "DominionSwordYwzjFinalTargetX";
+    private static final String FINAL_TARGET_Y = "DominionSwordYwzjFinalTargetY";
     private static final String FINAL_TARGET_Z = "DominionSwordYwzjFinalTargetZ";
     private static final String REPLAN_AFTER = "DominionSwordYwzjReplanAfter";
     private static final String PATH_POLICY_NBT = "DominionVehiclePathfindingPolicy";
@@ -171,6 +172,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String TRACKED_ESCAPE_PIVOT_YAW = "DominionSwordYwzjTrackedEscapePivotYaw";
     private static final String TRACKED_ESCAPE_PIVOT_UNTIL = "DominionSwordYwzjTrackedEscapePivotUntil";
     private static final String CAPTURED_TARGET_X = "DominionSwordYwzjCapturedTargetX";
+    private static final String CAPTURED_TARGET_Y = "DominionSwordYwzjCapturedTargetY";
     private static final String CAPTURED_TARGET_Z = "DominionSwordYwzjCapturedTargetZ";
     private static final String EFFECTIVE_ARRIVE_SINCE = "DominionSwordYwzjEffectiveArriveSince";
     private static final long EFFECTIVE_ARRIVAL_TIMEOUT_TICKS = 10L;
@@ -211,8 +213,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
      */
     private static final Map<UUID, Long> TRACKED_PROXY_DRIVE_UNTIL = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> HELICOPTER_SELECTION_TRACE_TICKS = new ConcurrentHashMap<>();
-    private static final int ASYNC_SNAPSHOT_CELLS_PER_TICK = 72;
     private static final String PATH_ASYNC_PENDING = "DominionSwordYwzjPathAsyncPending";
+    private static final double WHEEL_FRONTIER_STEP = 1.0D;
     private static final double TRACKED_POSE_CELL = 0.5D;
     private static final double TRACKED_POSE_FORWARD_STEP = 1.0D;
     /** A chassis rotation is a stop-and-pivot manoeuvre, not 0.3 blocks of free travel. */
@@ -222,19 +224,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     // A 30 degree heading lattice is enough for the tank's pivot steering, but avoids
     // spending half of a route search on nearly-identical 15 degree poses.
     private static final int TRACKED_POSE_HEADINGS = 12;
-    private static final int TRACKED_POSE_EXPANSIONS_PER_TICK = 24;
+    private static final int TRACKED_POSE_ACTIONS_PER_TICK = 24;
     /** Receding-horizon planner: never hold a driveable tank still for a long global search. */
-    private static final int TRACKED_POSE_PARTIAL_ROUTE_TICKS = 20;
-    private static final double TRACKED_POSE_PARTIAL_MIN_PROGRESS = 0.75D;
+    private static final int TRACKED_POSE_PARTIAL_ROUTE_TICKS = 80;
+    private static final double TRACKED_POSE_PARTIAL_MIN_PROGRESS = 8.0D;
+    private static final int TRACKED_POSE_MAX_ACTIVE_BUILDS = 16;
     /** Moving formation targets may drift while an incremental search is running. */
     private static final double TRACKED_POSE_TARGET_REUSE_RADIUS = 8.0D;
     /** Hard server-thread slice per vehicle.  Node count alone cannot bound OBB work. */
     private static final long TRACKED_POSE_SEARCH_BUDGET_NANOS = 2_000_000L;
     /** Route string-pulling runs synchronously after A* and therefore needs its own ceiling. */
     private static final long TRACKED_POSE_SIMPLIFY_BUDGET_NANOS = 2_000_000L;
-    private static final int TRACKED_POSE_MAX_EXPANSIONS = 10000;
-    private static final double TRACKED_POSE_MAX_RANGE = 48.0D;
-    private static final double TRACKED_POSE_GOAL_RADIUS = 1.10D;
+    private static final int TRACKED_POSE_MAX_EXPANSIONS = 4096;
+    private static final double TRACKED_POSE_GOAL_RADIUS = 1.0D;
     private static final double TRACKED_POSE_REACH_RADIUS = 0.36D;
     private static final double TRACKED_POSE_YAW_TOLERANCE = 4.0D;
     private static final double TRACKED_POSE_DIRECT_REVERSE_RANGE = 15.0D;
@@ -258,10 +260,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if(isTrackedVehicle(vehicle)) {
             TrackedPoseRoute route=TRACKED_POSE_ROUTES.get(vehicle.getUUID());
             if(route!=null && route.matches(target) && !route.steps.isEmpty()
-                    && flatDistance(route.safe,target)>TRACKED_POSE_GOAL_RADIUS+0.25D) {
+                    && (flatDistance(route.safe,target)>TRACKED_POSE_GOAL_RADIUS
+                    || !DominionGroundTransitionPolicy.sameLevel(route.safe.y-route.hull.entityGroundOffset,target.y,.75))) {
                 TrackedPose end=route.steps.get(route.steps.size()-1);
                 if(route.index>=route.steps.size() || route.index==route.steps.size()-1
-                        && flatDistance(vehicle.position(),end.position)<=TRACKED_POSE_REACH_RADIUS
+                        && routeEndpointMatches(vehicle.position(),end.position,TRACKED_POSE_REACH_RADIUS)
                         && Math.abs(Mth.wrapDegrees(end.yaw-vehicle.getYRot()))<=TRACKED_POSE_YAW_TOLERANCE) {
                     invalidateTrackedPoseRoute(vehicle,target,"march_partial_complete");
                     ensureRoute(player,vehicle,target,VehicleShape.from(vehicle));
@@ -302,6 +305,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 : com.arxyt.dominionsword.api.DominionGroundProfile.Kind.WHEELED,
                 shape.radius()*2, Math.max(1,shape.maxYOffset-shape.minYOffset),1,1,
                 isTrackedVehicle(vehicle) ? 0 : estimatedTurnRadius(vehicle,shape));
+    }
+    @Override
+    public boolean groundGoalHeightMatches(Entity vehicle, Vec3 goal) {
+        return groundGoalHeightMatchesLocal(vehicle,goal);
+    }
+    private static boolean groundGoalHeightMatchesLocal(Entity vehicle, Vec3 goal) {
+        if (vehicle == null || goal == null) return false;
+        double groundY = vehicle.getBoundingBox().minY;
+        if (vehicle instanceof AbstractVehicle chassis && isTrackedVehicle(vehicle)) {
+            TrackedHull hull = TrackedHull.from(chassis);
+            if (hull != null) groundY = vehicle.getY() - hull.entityGroundOffset;
+        }
+        return Math.abs(groundY - goal.y) <= 1.5D;
     }
     @Override public void holdGroundRoute(Entity vehicle) {
         unregisterActiveGroundControl(vehicle);
@@ -661,7 +677,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
             Vec3 flat = new Vec3(driveTarget.x - vehicle.getX(), 0.0D, driveTarget.z - vehicle.getZ());
             double distance = flat.length();
-            if (flatDistance(vehicle.position(), safeTarget) <= ARRIVE_RADIUS) {
+            if (flatDistance(vehicle.position(), safeTarget) <= ARRIVE_RADIUS
+                    && groundGoalHeightMatchesLocal(vehicle,safeTarget)) {
                 stopVehicle(vehicle);
                 return true;
             }
@@ -1362,7 +1379,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
         if (data.getBoolean(PATH_ASYNC_PENDING) && !hasActiveRoute(vehicle,target)) {
             AsyncRouteBuild old = ASYNC_ROUTES.remove(vehicle.getUUID());
-            if (old != null && old.future != null) old.future.cancel(false);
+            if (old != null) old.planner.cancel();
             data.remove(PATH_ASYNC_PENDING); clearRoute(vehicle);
         }
         if (data.getBoolean(PATH_ASYNC_PENDING)) {
@@ -1679,11 +1696,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         VehicleShape shape = VehicleShape.from(vehicle);
         traceRouteShape(vehicle, shape);
         LagTrace.mark("shape");
-        Vec3 safe = safeTargetNear(vehicle, target, shape, ignoredVehicles);
+        boolean distant=flatDistance(vehicle.position(),target)>12.0D;
+        Vec3 safe=distant?target:safeTargetNear(vehicle,target,shape,ignoredVehicles);
         LagTrace.mark("safe_target");
         long generation = data.getLong(PATH_GENERATION) + 1L;
         data.putLong(PATH_GENERATION, generation);
         data.putDouble(FINAL_TARGET_X, target.x);
+        data.putDouble(FINAL_TARGET_Y, target.y);
         data.putDouble(FINAL_TARGET_Z, target.z);
         data.putDouble(SAFE_TARGET_X, safe.x);
         data.putDouble(SAFE_TARGET_Y, safe.y);
@@ -1691,7 +1710,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         data.remove(PATH_BLOCKED);
         List<Vec3> route;
         double directDistance = Math.max(PATH_LOOKAHEAD_MIN, flatDistance(vehicle.position(), safe) + shape.radius());
-        boolean direct = canTravelDirect(vehicle, vehicle.position(), safe, shape, directDistance);
+        boolean direct = !distant && canTravelDirect(vehicle, vehicle.position(), safe, shape, directDistance);
         LagTrace.mark("direct_check:" + direct);
         if (pathPolicy(vehicle).equals(PATH_POLICY_DIRECT) || (!pathPolicy(vehicle).equals(PATH_POLICY_ALWAYS) && direct)) {
             route = List.of(vehicle.position(), safe);
@@ -1786,21 +1805,21 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         long generation = data.getLong(PATH_GENERATION) + 1L;
         data.putLong(PATH_GENERATION, generation);
         data.putDouble(FINAL_TARGET_X, target.x);
+        data.putDouble(FINAL_TARGET_Y, target.y);
         data.putDouble(FINAL_TARGET_Z, target.z);
         data.putDouble(SAFE_TARGET_X, target.x);
         data.putDouble(SAFE_TARGET_Y, target.y);
         data.putDouble(SAFE_TARGET_Z, target.z);
         data.remove(PATH_BLOCKED);
 
-        List<TrackedPose> direct = directTrackedPoseRoute(vehicle, target, hull, ignoredVehicles);
-        if (direct != null) {
-            installTrackedPoseRoute(player, vehicle, target, direct.get(direct.size() - 1).position(), generation, hull, direct);
-            pathDebug(vehicle, "POSE_ROUTE_DIRECT", "target=%s steps=%d", fmt(target), direct.size());
+        if (TRACKED_POSE_BUILDS.size() >= TRACKED_POSE_MAX_ACTIVE_BUILDS) {
+            data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 10L);
+            pathDebug(vehicle, "POSE_ROUTE_DEFER", "reason=active_limit active=%d", TRACKED_POSE_BUILDS.size());
             return;
         }
 
         double distance = flatDistance(vehicle.position(), target);
-        double range = Mth.clamp(Math.max(28.0D, distance + shape.radius() * 4.0D), 28.0D, PATH_SEARCH_RADIUS);
+        double range = Mth.clamp(Math.max(28.0D, distance + shape.radius() * 4.0D), 28.0D, 256.0D);
         TrackedPoseRouteBuild build = new TrackedPoseRouteBuild(vehicle.position(), vehicle.getYRot(), target, hull,
                 ignoredVehicles == null ? Set.of() : Set.copyOf(ignoredVehicles), generation, range,
                 vehicle.level().getGameTime());
@@ -1814,53 +1833,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (vehicle == null || target == null) return false;
         CompoundTag data = vehicle.getPersistentData();
         if (!data.getBoolean(PATH_BLOCKED) || !data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)) return false;
-        Vec3 failedTarget = new Vec3(data.getDouble(FINAL_TARGET_X), target.y, data.getDouble(FINAL_TARGET_Z));
+        if(!data.contains(FINAL_TARGET_Y) || Math.abs(data.getDouble(FINAL_TARGET_Y)-target.y)>.75)return false;
+        Vec3 failedTarget = new Vec3(data.getDouble(FINAL_TARGET_X), data.getDouble(FINAL_TARGET_Y), data.getDouble(FINAL_TARGET_Z));
         return flatDistanceSqr(target, failedTarget) <= 4.0D
                 && vehicle.level().getGameTime() < data.getLong(REPLAN_AFTER);
-    }
-
-    private static List<TrackedPose> directTrackedPoseRoute(Entity vehicle, Vec3 target, TrackedHull hull, Set<UUID> ignoredVehicles) {
-        Vec3 start = vehicle.position();
-        Vec3 horizontal = target.subtract(start).multiply(1.0D, 0.0D, 1.0D);
-        if (horizontal.lengthSqr() < 1.0E-6D) return List.of(new TrackedPose(start, vehicle.getYRot(), false));
-        float yaw = yawTo(horizontal);
-        if (trackedShouldDirectShortReverse(vehicle.getYRot(), yaw, horizontal.length())) {
-            float reverseYaw = Mth.wrapDegrees(yaw + 180.0F);
-            List<TrackedPose> route = new ArrayList<>();
-            route.add(new TrackedPose(start, vehicle.getYRot(), true));
-            int segments = Math.max(1, Mth.ceil(horizontal.length() / TRACKED_POSE_FORWARD_STEP));
-            Vec3 previous = start;
-            for (int i = 1; i <= segments; i++) {
-                double fraction = (double) i / segments;
-                Vec3 raw = new Vec3(Mth.lerp(fraction, start.x, target.x), previous.y,
-                        Mth.lerp(fraction, start.z, target.z));
-                Vec3 next = resolveTrackedPosePosition(vehicle, raw, reverseYaw, hull, ignoredVehicles, previous.y);
-                if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
-                route.add(new TrackedPose(next, reverseYaw, true));
-                previous = next;
-            }
-            pathDebug(vehicle, "POSE_ROUTE_SHORT_REVERSE", "target=%s distance=%.2f bodyYaw=%.1f reverseYaw=%.1f steps=%d",
-                    fmt(target), horizontal.length(), vehicle.getYRot(), reverseYaw, route.size());
-            return route;
-        }
-        if (!canTrackedPosePivot(vehicle, start, vehicle.getYRot(), yaw, hull, ignoredVehicles)) return null;
-        List<TrackedPose> route = new ArrayList<>();
-        route.add(new TrackedPose(start, vehicle.getYRot(), false));
-        if (Math.abs(Mth.wrapDegrees(yaw - vehicle.getYRot())) > TRACKED_POSE_YAW_TOLERANCE) route.add(new TrackedPose(start, yaw, false));
-        // Do not represent a 40-block clear road as a single control target.  The native
-        // tracked chassis can cover half a block per physics tick; command callbacks are much
-        // sparser, so a single endpoint guaranteed that it would overshoot the destination.
-        int segments = Math.max(1, Mth.ceil(horizontal.length() / TRACKED_POSE_FORWARD_STEP));
-        Vec3 previous = start;
-        for (int i = 1; i <= segments; i++) {
-            double fraction = (double) i / segments;
-            Vec3 raw = new Vec3(Mth.lerp(fraction, start.x, target.x), previous.y, Mth.lerp(fraction, start.z, target.z));
-            Vec3 next = resolveTrackedPosePosition(vehicle, raw, yaw, hull, ignoredVehicles, previous.y);
-            if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
-            route.add(new TrackedPose(next, yaw, false));
-            previous = next;
-        }
-        return route;
     }
 
     static boolean trackedShouldDirectShortReverse(float currentYaw, float targetYaw, double distance) {
@@ -1885,57 +1861,62 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         build.lastAdvanceTick = gameTick;
         long sliceStart = System.nanoTime();
         long deadline = sliceStart + TRACKED_POSE_SEARCH_BUDGET_NANOS;
-        int budget = TRACKED_POSE_EXPANSIONS_PER_TICK;
-        int expandedThisTick = 0;
-        while (budget-- > 0 && (expandedThisTick == 0 || System.nanoTime() < deadline) && planningBudget.step()) {
-            TrackedPoseNode node = build.open.poll();
-            if (node == null) {
+        int actionsThisTick = 0, expandedThisTick = 0, pollsThisTick = 0;
+        while (actionsThisTick < TRACKED_POSE_ACTIONS_PER_TICK
+                && (actionsThisTick == 0 || System.nanoTime() < deadline)) {
+            if (build.activeNode == null) {
+                if (pollsThisTick++ >= TRACKED_POSE_ACTIONS_PER_TICK) break;
+                TrackedPoseNode node = build.open.poll();
+                if (node == null) {
+                    build.cpuNanos += System.nanoTime() - sliceStart;
+                    if (!publishTrackedPosePartial(player,vehicle,build,"exhausted",gameTick))
+                        failTrackedPoseRoute(vehicle, build, "exhausted");
+                    return;
+                }
+                Double best = build.costs.get(node.key);
+                if (best == null || node.cost > best + 1.0E-6D) continue;
+                if (flatDistance(node.position, build.target) <= TRACKED_POSE_GOAL_RADIUS
+                        && DominionGroundTransitionPolicy.sameLevel(node.position.y-build.hull.entityGroundOffset,build.target.y,.75)) {
+                    List<TrackedPose> rawRoute = reconstructTrackedPoseRoute(node, build.startYaw);
+                    List<TrackedPose> route = simplifyTrackedPoseRoute(vehicle, rawRoute, build.hull, build.ignored);
+                    build.cpuNanos += System.nanoTime() - sliceStart;
+                    TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+                    installTrackedPoseRoute(player, vehicle, build.commandTarget, node.position, build.generation, build.hull, route);
+                    pathDebug(vehicle, "POSE_ROUTE_APPLIED", "generation=%d ticks=%d cpuMs=%.2f expanded=%d poseTests=%d cacheHits=%d obbFallbacks=%d terrainContacts=%d convexRejects=%d rejected=%d sweeps=%d rawSteps=%d simplifiedSteps=%d final=%s",
+                            build.generation, gameTick - build.startedTick + 1L, build.cpuNanos / 1_000_000.0D,
+                            build.expanded, build.poseTests, build.cacheHits, build.obbFallbacks,
+                            build.terrainContacts, build.convexRejects, build.rejectedPoses, build.sweeps,
+                            rawRoute.size(), route.size(), fmt(node.position));
+                    return;
+                }
+                if (build.expanded >= TRACKED_POSE_MAX_EXPANSIONS) {
+                    build.cpuNanos += System.nanoTime() - sliceStart;
+                    if (!publishTrackedPosePartial(player,vehicle,build,"node_limit",gameTick))
+                        failTrackedPoseRoute(vehicle, build, "node_limit");
+                    return;
+                }
+                build.activeNode = node;
+                build.nextAction = 0;
+                pathDebug(vehicle, "POSE_EXPAND", "generation=%d expanded=%d key=(%d,%d,%d) node=%s yaw=%.1f g=%.3f f=%.3f open=%d",
+                        build.generation, build.expanded, node.key.x, node.key.z, node.key.heading,
+                        fmt(node.position), trackedPoseYaw(node.key.heading), node.cost, node.priority, build.open.size());
+            }
+            // Each rotation/translation is a separate budgeted action. The active node survives a pause.
+            if (!planningBudget.step()) break;
+            if (build.nextAction == 0) { build.expanded++; expandedThisTick++; }
+            expandTrackedPoseAction(vehicle,build,build.activeNode,build.nextAction++);
+            actionsThisTick++;
+            if (build.nextAction == 4) build.activeNode = null;
+            if ((build.hitBoundary || build.hitNodeLimit)
+                    && publishTrackedPosePartial(player,vehicle,build,
+                    build.hitNodeLimit ? "node_limit" : "boundary",gameTick)) {
                 build.cpuNanos += System.nanoTime() - sliceStart;
-                failTrackedPoseRoute(vehicle, build, "exhausted");
                 return;
             }
-            Double best = build.costs.get(node.key);
-            if (best == null || node.cost > best + 1.0E-6D) continue;
-            pathDebug(vehicle, "POSE_EXPAND", "generation=%d expanded=%d key=(%d,%d,%d) node=%s yaw=%.1f g=%.3f f=%.3f open=%d",
-                    build.generation, build.expanded, node.key.x, node.key.z, node.key.heading,
-                    fmt(node.position), trackedPoseYaw(node.key.heading), node.cost, node.priority, build.open.size());
-            if (flatDistance(node.position, build.target) <= TRACKED_POSE_GOAL_RADIUS) {
-                List<TrackedPose> rawRoute = reconstructTrackedPoseRoute(node, build.startYaw);
-                List<TrackedPose> route = simplifyTrackedPoseRoute(vehicle, rawRoute, build.hull, build.ignored);
-                build.cpuNanos += System.nanoTime() - sliceStart;
-                TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
-                installTrackedPoseRoute(player, vehicle, build.commandTarget, node.position, build.generation, build.hull, route);
-                pathDebug(vehicle, "POSE_ROUTE_APPLIED", "generation=%d ticks=%d cpuMs=%.2f expanded=%d poseTests=%d cacheHits=%d obbFallbacks=%d terrainContacts=%d convexRejects=%d rejected=%d sweeps=%d rawSteps=%d simplifiedSteps=%d final=%s",
-                        build.generation, gameTick - build.startedTick + 1L, build.cpuNanos / 1_000_000.0D,
-                        build.expanded, build.poseTests, build.cacheHits, build.obbFallbacks,
-                        build.terrainContacts, build.convexRejects, build.rejectedPoses, build.sweeps,
-                        rawRoute.size(), route.size(), fmt(node.position));
-                return;
-            }
-            if (++build.expanded > TRACKED_POSE_MAX_EXPANSIONS) {
-                build.cpuNanos += System.nanoTime() - sliceStart;
-                failTrackedPoseRoute(vehicle, build, "budget");
-                return;
-            }
-            expandedThisTick++;
-            expandTrackedPoseNode(vehicle, build, node);
         }
         build.cpuNanos += System.nanoTime() - sliceStart;
         if (gameTick - build.startedTick + 1L >= TRACKED_POSE_PARTIAL_ROUTE_TICKS
-                && build.bestNode != null
-                && build.bestNode.parent != null
-                && flatDistance(build.anchor, build.bestNode.position) >= TRACKED_POSE_PARTIAL_MIN_PROGRESS) {
-            List<TrackedPose> rawRoute = reconstructTrackedPoseRoute(build.bestNode, build.startYaw);
-            List<TrackedPose> route = simplifyTrackedPoseRoute(vehicle, rawRoute, build.hull, build.ignored);
-            TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
-            installTrackedPoseRoute(player, vehicle, build.commandTarget, build.bestNode.position,
-                    build.generation, build.hull, route);
-            pathDebug(vehicle, "POSE_ROUTE_PARTIAL", "generation=%d ticks=%d cpuMs=%.2f expanded=%d rawSteps=%d simplifiedSteps=%d progress=%.2f remaining=%.2f",
-                    build.generation, gameTick - build.startedTick + 1L, build.cpuNanos / 1_000_000.0D,
-                    build.expanded, rawRoute.size(), route.size(), flatDistance(build.anchor, build.bestNode.position),
-                    flatDistance(build.bestNode.position, build.target));
-            return;
-        }
+                && publishTrackedPosePartial(player,vehicle,build,"time",gameTick)) return;
         if (gameTick - build.lastProgressTick >= 20L) {
             build.lastProgressTick = gameTick;
             pathDebug(vehicle, "POSE_ROUTE_PROGRESS", "generation=%d ticks=%d sliceMs=%.2f cpuMs=%.2f tickExpanded=%d expanded=%d open=%d poseTests=%d cacheHits=%d obbFallbacks=%d terrainContacts=%d convexRejects=%d rejected=%d sweeps=%d",
@@ -1949,23 +1930,44 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
     }
 
-    private static void expandTrackedPoseNode(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseNode node) {
-        int left = Math.floorMod(node.key.heading - 1, TRACKED_POSE_HEADINGS);
-        int right = Math.floorMod(node.key.heading + 1, TRACKED_POSE_HEADINGS);
-        addTrackedPoseRotation(vehicle, build, node, left);
-        addTrackedPoseRotation(vehicle, build, node, right);
-        addTrackedPoseTranslation(vehicle, build, node, false);
-        addTrackedPoseTranslation(vehicle, build, node, true);
+    private static boolean publishTrackedPosePartial(ServerPlayer player,Entity vehicle,
+                                                     TrackedPoseRouteBuild build,String reason,long gameTick) {
+        TrackedPoseNode best=build.bestNode;
+        if(best==null || best.parent==null
+                || flatDistance(build.anchor,best.position)<TRACKED_POSE_PARTIAL_MIN_PROGRESS
+                || trackedGoalDistance(best.position,build.target,build.hull)
+                >= trackedGoalDistance(build.anchor,build.target,build.hull)-1.0D)return false;
+        List<TrackedPose> rawRoute=reconstructTrackedPoseRoute(best,build.startYaw);
+        List<TrackedPose> route=simplifyTrackedPoseRoute(vehicle,rawRoute,build.hull,build.ignored);
+        if(route.size()<2)return false;
+        TRACKED_POSE_BUILDS.remove(vehicle.getUUID());
+        installTrackedPoseRoute(player,vehicle,build.commandTarget,best.position,build.generation,build.hull,route);
+        pathDebug(vehicle,"POSE_ROUTE_PARTIAL","reason=%s generation=%d ticks=%d cpuMs=%.2f expanded=%d rawSteps=%d simplifiedSteps=%d progress=%.2f remaining=%.2f",
+                reason,build.generation,gameTick-build.startedTick+1L,build.cpuNanos/1_000_000.0D,
+                build.expanded,rawRoute.size(),route.size(),flatDistance(build.anchor,best.position),
+                flatDistance(best.position,build.target));
+        return true;
+    }
+
+    private static void expandTrackedPoseAction(Entity vehicle, TrackedPoseRouteBuild build,
+                                                TrackedPoseNode node,int action) {
+        switch(action) {
+            case 0 -> addTrackedPoseRotation(vehicle,build,node,Math.floorMod(node.key.heading-1,TRACKED_POSE_HEADINGS));
+            case 1 -> addTrackedPoseRotation(vehicle,build,node,Math.floorMod(node.key.heading+1,TRACKED_POSE_HEADINGS));
+            case 2 -> addTrackedPoseTranslation(vehicle,build,node,false);
+            case 3 -> addTrackedPoseTranslation(vehicle,build,node,true);
+            default -> throw new IllegalArgumentException("Invalid tracked pose action");
+        }
     }
 
     private static void addTrackedPoseRotation(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseNode from, int heading) {
         float yaw = trackedPoseYaw(heading);
-        if (!canTrackedPoseOccupy(vehicle, from.position, yaw, build.hull, build.ignored)) {
+        if (!canTrackedPosePivot(vehicle, from.position, trackedPoseYaw(from.key.heading), yaw, build.hull, build.ignored)) {
             pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=rotate from=(%d,%d,%d) toHeading=%d yaw=%.1f reason=occupancy",
                     from.key.x, from.key.z, from.key.heading, heading, yaw);
             return;
         }
-        TrackedPoseKey key = new TrackedPoseKey(from.key.x, from.key.z, heading);
+        TrackedPoseKey key = new TrackedPoseKey(from.key.x, from.key.z, from.key.y16, heading);
         pathDebug(vehicle, "POSE_CANDIDATE_PASS", "action=rotate from=(%d,%d,%d) to=(%d,%d,%d) pos=%s yaw=%.1f",
                 from.key.x, from.key.z, from.key.heading, key.x, key.z, key.heading, fmt(from.position), yaw);
         addTrackedPoseNode(vehicle, build, key, from.position, from, TRACKED_POSE_ROTATION_COST, false);
@@ -1984,12 +1986,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return;
         }
         if (!build.inRange(quantized)) {
+            build.hitBoundary = true;
             pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=%s from=(%d,%d,%d) target=%s reason=range",
                     reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading, fmt(quantized));
             return;
         }
         Vec3 end = sweepTrackedPose(vehicle, from.position, quantized, yaw, build.hull, build.ignored, reverse);
-        if (end == null) {
+        if (end == null || !DominionGroundTransitionPolicy.allowed(from.position.y,end.y,MAX_TRAVEL_STEP_HEIGHT,MAX_TRAVEL_STEP_HEIGHT)) {
             pathDebug(vehicle, "POSE_CANDIDATE_REJECT", "action=%s from=(%d,%d,%d) target=%s yaw=%.1f reason=sweep",
                     reverse ? "reverse" : "forward", from.key.x, from.key.z, from.key.heading, fmt(quantized), yaw);
             return;
@@ -2000,10 +2003,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         addTrackedPoseNode(vehicle, build, key, end, from, flatDistance(from.position, end) * (reverse ? 1.85D : 1.0D), reverse);
     }
 
+    private static double trackedGoalDistance(Vec3 position,Vec3 target,TrackedHull hull) {
+        return flatDistance(position,target)+Math.abs(position.y-hull.entityGroundOffset-target.y)*2.0D;
+    }
+
     private static void addTrackedPoseNode(Entity vehicle, TrackedPoseRouteBuild build, TrackedPoseKey key, Vec3 position,
                                            TrackedPoseNode parent, double cost, boolean reverse) {
-        double total = parent.cost + cost;
+        key = trackedPoseKey(build.anchor,position,key.heading);
+        double total = parent.cost + cost + DominionGroundTransitionPolicy.heightPenalty(parent.position.y,position.y);
         Double previous = build.costs.get(key);
+        if(previous==null && build.costs.size()>=TRACKED_POSE_MAX_EXPANSIONS) {
+            build.hitNodeLimit=true;
+            return;
+        }
         if (previous != null && previous <= total) {
             pathDebug(vehicle, "POSE_NODE_REJECT", "generation=%d key=(%d,%d,%d) newG=%.3f oldG=%.3f reason=not_better",
                     build.generation, key.x, key.z, key.heading, total, previous);
@@ -2013,12 +2025,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         // Weighted A* keeps the open set aimed at the command target.  With an exact OBB test
         // a broad, unweighted search spent most of its budget rotating through local poses
         // around the first obstacle before it had advanced down either viable side.
-        double heuristic = flatDistance(position, build.target);
+        double heuristic = trackedGoalDistance(position,build.target,build.hull);
         TrackedPoseNode opened = new TrackedPoseNode(key, position, parent, total,
                 total + heuristic * TRACKED_POSE_HEURISTIC_WEIGHT, reverse);
         build.open.add(opened);
         double bestHeuristic = build.bestNode == null
-                ? Double.POSITIVE_INFINITY : flatDistance(build.bestNode.position, build.target);
+                ? Double.POSITIVE_INFINITY : trackedGoalDistance(build.bestNode.position, build.target,build.hull);
         if (heuristic < bestHeuristic - 1.0E-6D
                 || (Math.abs(heuristic - bestHeuristic) <= 1.0E-6D
                 && (build.bestNode == null || total < build.bestNode.cost))) {
@@ -2095,7 +2107,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         float yaw = yawTo(horizontal);
         if (!canTrackedPosePivot(vehicle, from.position, from.yaw, yaw, hull, ignoredVehicles)) return null;
         Vec3 reached = sweepTrackedPose(vehicle, from.position, to.position, yaw, hull, ignoredVehicles, false, deadline);
-        if (reached == null || flatDistance(reached, to.position) > 0.10D) return null;
+        if (reached == null || !routeEndpointMatches(reached, to.position, 0.10D)) return null;
 
         List<TrackedPose> steps = new ArrayList<>();
         if (Math.abs(Mth.wrapDegrees(yaw - from.yaw)) > TRACKED_POSE_YAW_TOLERANCE) {
@@ -2109,7 +2121,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             Vec3 raw = new Vec3(Mth.lerp(fraction, from.position.x, to.position.x), previous.y,
                     Mth.lerp(fraction, from.position.z, to.position.z));
             Vec3 next = resolveTrackedPosePosition(vehicle, raw, yaw, hull, ignoredVehicles, previous.y);
-            if (next == null || !terrainStepAllowed(previous.y, next.y)) return null;
+            if (next == null || !DominionGroundTransitionPolicy.allowed(previous.y,next.y,
+                    MAX_TRAVEL_STEP_HEIGHT,MAX_TRAVEL_STEP_HEIGHT)) return null;
             steps.add(new TrackedPose(next, yaw, false));
             previous = next;
         }
@@ -2173,8 +2186,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 // not neutral-lock such a pose: let native physics drive toward the command and
                 // let the motion watchdog promote an actual twelve-tick stall to recovery.
                 data.putLong(REPLAN_AFTER, vehicle.level().getGameTime() + 8L);
-                TRACKED_PROXY_DRIVE_UNTIL.put(vehicle.getUUID(), vehicle.level().getGameTime() + 20L);
-                pathDebug(vehicle, "POSE_START_PROXY_CONFLICT", "generation=%d expanded=%d pose=%s yaw=%.1f nativeStuckTick=%d action=native_drive_watchdog",
+                TRACKED_PROXY_DRIVE_UNTIL.remove(vehicle.getUUID());
+                pathDebug(vehicle, "POSE_START_PROXY_CONFLICT", "generation=%d expanded=%d pose=%s yaw=%.1f nativeStuckTick=%d action=wait_for_checked_route",
                         build.generation, build.expanded, fmt(vehicle.position()), vehicle.getYRot(), nativeStuckTick);
             }
         }
@@ -2239,11 +2252,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             boolean rotationStep = previous != null && previous.position.equals(step.position);
             // A pure rotation state is complete when its heading is complete.  Its recorded
             // position may be behind the hull after braking, and must not be chased as a point.
-            if (rotationStep && Math.abs(yawDiff) <= TRACKED_POSE_YAW_TOLERANCE) {
+            if (rotationStep && sameRouteLevel(vehicle.position(),step.position)
+                    && Math.abs(yawDiff) <= TRACKED_POSE_YAW_TOLERANCE) {
                 route.index++;
                 continue;
             }
-            if (distance <= TRACKED_POSE_REACH_RADIUS
+            if (distance <= TRACKED_POSE_REACH_RADIUS && sameRouteLevel(vehicle.position(),step.position)
                     && Math.abs(yawDiff) <= TRACKED_POSE_YAW_TOLERANCE) {
                 route.index++;
                 continue;
@@ -2281,13 +2295,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 boolean right = yawDiff > 0.0F;
                 return new GroundControlState(false, false, right, !right, false);
             }
-            if (distance <= TRACKED_POSE_REACH_RADIUS) {
+            if (distance <= TRACKED_POSE_REACH_RADIUS && sameRouteLevel(vehicle.position(),step.position)) {
                 route.index++;
                 continue;
             }
             Vec3 verified = sweepTrackedPose(vehicle, vehicle.position(), step.position, step.yaw,
                     route.hull(), Set.of(vehicle.getUUID()), step.reverse);
-            if (verified == null || flatDistance(verified, step.position) > 0.55D) {
+            if (verified == null || !routeEndpointMatches(verified,step.position,0.55D)) {
                 if (isTrackedPhysicallyStuck(vehicle)) {
                     beginTrackedRecovery(vehicle, route.target);
                 } else {
@@ -2328,7 +2342,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         // Keep this finished route installed as a velocity hold.  Removing it would leave the
         // last forward key latched until the next high-level command callback, which was the
         // source of the long drive past the selected point.
-        if (flatDistance(route.safe, route.target) > TRACKED_POSE_GOAL_RADIUS + 0.25D) {
+        if (flatDistance(route.safe, route.target) > TRACKED_POSE_GOAL_RADIUS
+                || !DominionGroundTransitionPolicy.sameLevel(route.safe.y-route.hull.entityGroundOffset,route.target.y,.75)) {
             invalidateTrackedPoseRoute(vehicle, route.target, "partial_complete");
             return new GroundControlState(false, false, false, false, false);
         }
@@ -2435,7 +2450,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     : previous.add(step.position.subtract(previous).scale(remaining / segment));
             Vec3 reached = sweepTrackedPose(vehicle, previous, target, step.yaw,
                     route.hull(), Set.of(vehicle.getUUID()), step.reverse);
-            if (reached == null || flatDistance(reached, target) > TRACKED_POSE_REACH_RADIUS) return false;
+            if (reached == null || !routeEndpointMatches(reached,target,TRACKED_POSE_REACH_RADIUS)) return false;
             remaining -= Math.min(segment, remaining);
             previous = target;
         }
@@ -2450,8 +2465,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static Vec3 trackedStoredTarget(Entity vehicle) {
         CompoundTag data = vehicle.getPersistentData();
-        if (data.contains(FINAL_TARGET_X) && data.contains(FINAL_TARGET_Z)) {
-            return new Vec3(data.getDouble(FINAL_TARGET_X), vehicle.getY(), data.getDouble(FINAL_TARGET_Z));
+        if (data.contains(FINAL_TARGET_X) && data.contains(FINAL_TARGET_Y) && data.contains(FINAL_TARGET_Z)) {
+            return new Vec3(data.getDouble(FINAL_TARGET_X), data.getDouble(FINAL_TARGET_Y), data.getDouble(FINAL_TARGET_Z));
         }
         return vehicle.position();
     }
@@ -2653,7 +2668,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         TrackedPoseRouteBuild activeBuild = vehicle == null ? null : TRACKED_POSE_BUILDS.get(vehicle.getUUID());
         if (activeBuild != null) activeBuild.sweeps++;
         double distance = flatDistance(from, target);
-        if (distance < 1.0E-6D) return resolveTrackedPosePosition(vehicle, target, yaw, hull, ignoredVehicles, from.y);
+        if (distance < 1.0E-6D) {
+            Vec3 resolved=resolveTrackedPosePosition(vehicle,target,yaw,hull,ignoredVehicles,from.y);
+            return resolved!=null && DominionGroundTransitionPolicy.allowed(from.y,resolved.y,MAX_TRAVEL_STEP_HEIGHT,MAX_TRAVEL_STEP_HEIGHT)?resolved:null;
+        }
         int samples = Math.max(1, Mth.ceil(distance / 0.25D));
         Vec3 previous = from;
         for (int i = 1; i <= samples; i++) {
@@ -2666,7 +2684,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                         fmt(from), fmt(target), yaw, reverse, i, samples, fmt(raw), fmt(previous));
                 return null;
             }
-            if (!terrainStepAllowed(previous.y, next.y)) {
+            if (!DominionGroundTransitionPolicy.allowed(previous.y, next.y,MAX_TRAVEL_STEP_HEIGHT,MAX_TRAVEL_STEP_HEIGHT)) {
                 pathDebug(vehicle, "POSE_SWEEP_REJECT", "from=%s target=%s yaw=%.1f reverse=%s sample=%d/%d previous=%s next=%s dy=%.3f maxDy=%.3f reason=step_height",
                         fmt(from), fmt(target), yaw, reverse, i, samples, fmt(previous), fmt(next), next.y - previous.y, MAX_TRAVEL_STEP_HEIGHT);
                 return null;
@@ -2690,33 +2708,21 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                     fmt(around), referenceY, fmt(bridged), yaw);
             return bridged;
         }
-        BlockPos base = BlockPos.containing(around.x, referenceY, around.z);
-        for (int dy = 2; dy >= -4; dy--) {
-            BlockPos floor = base.offset(0, dy - 1, 0);
-            if (!level.getBlockState(floor).isSolid()) continue;
-            Vec3 candidate = new Vec3(around.x, floor.getY() + 1.0D + hull.entityGroundOffset, around.z);
-            if (canTrackedPoseOccupy(vehicle, candidate, yaw, hull, ignoredVehicles)) {
-                pathDebug(vehicle, "POSE_RESOLVE_PASS", "around=%s referenceY=%.3f floor=(%d,%d,%d) floorState=%s groundOffset=%.3f candidate=%s yaw=%.1f",
-                        fmt(around), referenceY, floor.getX(), floor.getY(), floor.getZ(),
-                        level.getBlockState(floor).getBlock(), hull.entityGroundOffset, fmt(candidate), yaw);
-                return candidate;
-            }
-            pathDebug(vehicle, "POSE_RESOLVE_TRY_REJECT", "around=%s referenceY=%.3f floor=(%d,%d,%d) floorState=%s groundOffset=%.3f candidate=%s yaw=%.1f",
-                    fmt(around), referenceY, floor.getX(), floor.getY(), floor.getZ(),
-                    level.getBlockState(floor).getBlock(), hull.entityGroundOffset, fmt(candidate), yaw);
+        BlockPos base = BlockPos.containing(around.x, referenceY-hull.entityGroundOffset, around.z);
+        if(!level.hasChunkAt(base))return null;
+        List<Double> heights=new ArrayList<>();
+        for(int dy=-3;dy<=2;dy++) {
+            BlockPos floor=base.offset(0,dy,0);
+            var collision=level.getBlockState(floor).getCollisionShape(level,floor);
+            if(!collision.isEmpty())heights.add(floor.getY()+collision.max(net.minecraft.core.Direction.Axis.Y)+hull.entityGroundOffset);
         }
-        int terrainY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, Mth.floor(around.x), Mth.floor(around.z));
-        double entityY = terrainY + hull.entityGroundOffset;
-        if (Math.abs(entityY - referenceY) > 1.0E-6D) {
-            Vec3 candidate = new Vec3(around.x, entityY, around.z);
-            if (canTrackedPoseOccupy(vehicle, candidate, yaw, hull, ignoredVehicles)) {
-                pathDebug(vehicle, "POSE_RESOLVE_PASS", "around=%s referenceY=%.3f heightmapY=%d groundOffset=%.3f candidate=%s yaw=%.1f source=heightmap",
-                        fmt(around), referenceY, terrainY, hull.entityGroundOffset, fmt(candidate), yaw);
-                return candidate;
-            }
+        heights.sort(Comparator.comparingDouble((Double y)->Math.abs(y-referenceY)).thenComparingDouble(Double::doubleValue));
+        for(double y:heights) {
+            if(!DominionGroundTransitionPolicy.allowed(referenceY,y,MAX_TRAVEL_STEP_HEIGHT,MAX_TRAVEL_STEP_HEIGHT))continue;
+            Vec3 candidate=new Vec3(around.x,y,around.z);
+            if(canTrackedPoseOccupy(vehicle,candidate,yaw,hull,ignoredVehicles))return candidate;
         }
-        pathDebug(vehicle, "POSE_RESOLVE_REJECT", "around=%s referenceY=%.3f yaw=%.1f base=(%d,%d,%d) heightmapY=%d groundOffset=%.3f reason=no_occupiable_height",
-                fmt(around), referenceY, yaw, base.getX(), base.getY(), base.getZ(), terrainY, hull.entityGroundOffset);
+
         return null;
     }
 
@@ -2740,6 +2746,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
         TrackedPoseTransform transform = hull.transform(chassis, position, yaw);
         AABB bounds = transform.bounds();
+        for(int cx=Mth.floor(bounds.minX)>>4;cx<=Mth.floor(bounds.maxX)>>4;cx++)
+            for(int cz=Mth.floor(bounds.minZ)>>4;cz<=Mth.floor(bounds.maxZ)>>4;cz++)
+                if(!level.hasChunkAt(new BlockPos(cx*16,Mth.floor(position.y),cz*16)))return false;
         int supportMask = trackedPoseSupportMask(level, transform);
         if (!trackedSupportPatternAccepts((supportMask & 1) != 0, (supportMask & 2) != 0,
                 (supportMask & 4) != 0, (supportMask & 8) != 0, (supportMask & 16) != 0)) {
@@ -2839,12 +2848,11 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return result;
     }
 
-    /** Half-block position cache; yaw remains at five-degree precision for direct shortcuts. */
-    private static TrackedPoseCacheKey trackedPoseCacheKey(Vec3 position, float yaw) {
-        return new TrackedPoseCacheKey((int) Math.round(position.x * 2.0D),
-                (int) Math.round(position.y * 2.0D),
-                (int) Math.round(position.z * 2.0D),
-                Math.round(Mth.wrapDegrees(yaw) / 5.0F));
+    /** Collision results belong to the exact pose, including the precise support height. */
+    static TrackedPoseCacheKey trackedPoseCacheKey(Vec3 position, float yaw) {
+        return new TrackedPoseCacheKey(Double.doubleToLongBits(position.x),
+                Double.doubleToLongBits(position.y), Double.doubleToLongBits(position.z),
+                Float.floatToIntBits(Mth.wrapDegrees(yaw)));
     }
 
     /**
@@ -2953,9 +2961,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return Mth.wrapDegrees(heading * (360.0F / TRACKED_POSE_HEADINGS));
     }
 
-    private static TrackedPoseKey trackedPoseKey(Vec3 anchor, Vec3 position, int heading) {
+    static TrackedPoseKey trackedPoseKey(Vec3 anchor, Vec3 position, int heading) {
         return new TrackedPoseKey((int) Math.round((position.x - anchor.x) / TRACKED_POSE_CELL),
-                (int) Math.round((position.z - anchor.z) / TRACKED_POSE_CELL), heading);
+                (int) Math.round((position.z - anchor.z) / TRACKED_POSE_CELL), (int)Math.round((position.y-anchor.y)*16), heading);
     }
 
     private static Vec3 trackedPosePosition(Vec3 anchor, TrackedPoseKey key, double y) {
@@ -3003,7 +3011,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             }
         }
         double lookahead = dynamicLookahead(speed, shape);
-        return clippedTarget(vehicle.position(), finalTarget, lookahead);
+        Vec3 fallback = clippedTarget(vehicle.position(), finalTarget, lookahead);
+        return canTravelDirect(vehicle, vehicle.position(), fallback, shape,
+                Math.max(PATH_LOOKAHEAD_MIN, flatDistance(vehicle.position(), fallback) + shape.radius())) ? fallback : null;
     }
 
     private static Vec3 trackedAsyncProgressTarget(Entity vehicle, Vec3 finalTarget, VehicleShape shape) {
@@ -3019,13 +3029,14 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static boolean startAsyncRoute(Entity vehicle, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation) {
         AsyncRouteBuild previous = ASYNC_ROUTES.get(vehicle.getUUID());
         if (previous != null && previous.generation == generation) return true;
-        if (previous != null && previous.future != null) previous.future.cancel(false);
+        if (previous != null) previous.planner.cancel();
         ASYNC_ROUTES.remove(vehicle.getUUID());
+        if (ASYNC_ROUTES.size() >= 16) return true; // Remain pending and retry next tick.
         Vec3 start = vehicle.position();
-        int radius = Math.min(32, (int) Math.ceil(PATH_SEARCH_RADIUS / PATH_STEP));
-        int gx = Mth.clamp((int) Math.round((safe.x - start.x) / PATH_STEP), -radius, radius);
-        int gz = Mth.clamp((int) Math.round((safe.z - start.z) / PATH_STEP), -radius, radius);
-        ASYNC_ROUTES.put(vehicle.getUUID(), new AsyncRouteBuild(start, safe, shape, ignored == null ? Set.of() : Set.copyOf(ignored), generation, radius, gx, gz));
+        int radius = 255; // One-block transitions inside a bounded 255-block window.
+        int gx = (int) Math.round((safe.x - start.x) / WHEEL_FRONTIER_STEP);
+        int gz = (int) Math.round((safe.z - start.z) / WHEEL_FRONTIER_STEP);
+        ASYNC_ROUTES.put(vehicle.getUUID(), new AsyncRouteBuild(vehicle, start, safe, shape, ignored == null ? Set.of() : Set.copyOf(ignored), generation, radius, gx, gz));
         return true;
     }
 
@@ -3035,44 +3046,27 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
         AsyncRouteBuild build = ASYNC_ROUTES.get(vehicle.getUUID());
         CompoundTag data = vehicle.getPersistentData();
-        if (build == null || build.generation != data.getLong(PATH_GENERATION)) { data.remove(PATH_ASYNC_PENDING); return; }
-        if (build.future == null) {
-            int budget = ASYNC_SNAPSHOT_CELLS_PER_TICK;
-            while (budget-- > 0 && build.cursor < Math.min(build.sampleLimit, build.points.size()) && planningBudget.step()) {
-                DominionAsyncGridPlanner.Point point = build.points.get(build.cursor++);
-                Vec3 raw = build.start.add(point.x() * PATH_STEP, 0.0D, point.z() * PATH_STEP);
-                Vec3 occupy = occupiableNear(vehicle, raw, build.shape, build.ignored);
-                if (occupy != null) {
-                    double penalty = terrainPenalty(vehicle, occupy) + otherVehiclePenalty(vehicle, occupy, build.shape, build.ignored) + reservationPenalty(vehicle, occupy, build.shape);
-                    build.cells.put(point.key(), new DominionAsyncGridPlanner.Cell(occupy.y, penalty));
-                }
-            }
-            if (build.cursor < Math.min(build.sampleLimit, build.points.size())) return;
-            DominionAsyncGridPlanner.Point startPoint = new DominionAsyncGridPlanner.Point(0, 0);
-            DominionAsyncGridPlanner.Point goalPoint = new DominionAsyncGridPlanner.Point(build.goalX, build.goalZ);
-            if (!planningBudget.step()) return;
-            build.future = DominionAsyncGridPlanner.submit(new DominionAsyncGridPlanner.Snapshot(startPoint, goalPoint, Map.copyOf(build.cells), PATH_MAX_ITERATIONS, terrainGridStepHeight(), 2.0D));
-            return;
+        if (build == null) {
+            startAsyncRoute(vehicle, activeSafeTarget(vehicle, target), VehicleShape.from(vehicle), ignored,
+                    data.getLong(PATH_GENERATION));
+            build = ASYNC_ROUTES.get(vehicle.getUUID());
+            if (build == null) return;
         }
-        if (!build.future.isDone()) return;
-        DominionAsyncGridPlanner.Result result = build.future.getNow(null);
-        if ((result == null || !result.found()) && build.sampleLimit < build.points.size()) {
-            build.sampleLimit = com.arxyt.dominionsword.api.DominionRouteSampling.nextLimit(build.sampleLimit, build.points.size());
-            build.future = null;
-            return;
+        if (build.generation != data.getLong(PATH_GENERATION)) {
+            ASYNC_ROUTES.remove(vehicle.getUUID()); build.planner.cancel(); data.remove(PATH_ASYNC_PENDING); return;
         }
-        if (result == null || !result.usable()) {
+        DominionFrontierPlanner.Result<RouteState> result = build.planner.advance(planningBudget::step);
+        if (result.status() == DominionFrontierPlanner.Status.PENDING) return;
+        if (result.path().size() < 2) {
             ASYNC_ROUTES.remove(vehicle.getUUID()); data.remove(PATH_ASYNC_PENDING); data.putBoolean(PATH_BLOCKED, true); return;
         }
         if (build.candidate == null) {
             build.candidate = new ArrayList<>();
-            for (DominionAsyncGridPlanner.Point point : result.points()) {
-                DominionAsyncGridPlanner.Cell cell = build.cells.get(point.key());
-                if (cell != null) build.candidate.add(new Vec3(build.start.x + point.x()*PATH_STEP,cell.y(),build.start.z + point.z()*PATH_STEP));
-            }
-            // Append only a short final connection; it goes through the same incremental validation.
+            for (RouteState state : result.path()) build.candidate.add(state.position());
+            // A partial path remains partial; only a completed search may connect to the real goal.
             Vec3 last = build.candidate.get(build.candidate.size()-1);
-            if (last.distanceToSqr(build.safe) <= 36 && last.distanceToSqr(build.safe) > .01) build.candidate.add(build.safe);
+            if (result.status() == DominionFrontierPlanner.Status.COMPLETE
+                    && last.distanceToSqr(build.safe) <= 36 && last.distanceToSqr(build.safe) > .01) build.candidate.add(build.safe);
         }
         while (build.validated < build.candidate.size()) {
             if (!planningBudget.step()) return;
@@ -3114,7 +3108,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 return null;
             }
             double reach = Math.max(2.0D, shape.radius() * 0.55D);
-            if (flatDistance(position, point) <= reach || hasPassedPoint(position, previous, point) || canSkipAligned(vehicle, position, previous, point, next, shape)) {
+            if (routeEndpointMatches(position,point,reach)
+                    || hasPassedPoint(position, previous, point)
+                    || canSkipAligned(vehicle, position, previous, point, next, shape)) {
                 index++;
                 data.putInt(PATH_INDEX, index);
                 continue;
@@ -3123,7 +3119,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return routeLookaheadPoint(vehicle, points, index, position, finalTarget, shape, speed);
         }
         clearRoute(vehicle);
-        if (flatDistance(position, finalTarget) <= Math.max(6,shape.radius()*2)
+        if (routeEndpointMatches(position,finalTarget,Math.max(6,shape.radius()*2))
                 && canSweep(vehicle,position,finalTarget,shape,Set.of(vehicle.getUUID()))) return finalTarget;
         data.putBoolean(PATH_BLOCKED,true);
         return null;
@@ -3284,33 +3280,35 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static boolean canTravelDirect(Entity vehicle, Vec3 from, Vec3 to, VehicleShape shape, double maxDistance) {
         double distance = flatDistance(from, to);
-        if (distance < 1.0E-6D) return true;
+        if (distance < 1.0E-6D) return sameRouteLevel(from,to);
         Vec3 dir = to.subtract(from).multiply(1.0D, 0.0D, 1.0D).normalize();
         double checked = Math.min(distance, maxDistance);
         Vec3 previous = occupiableNear(vehicle, from, shape, Set.of(vehicle.getUUID()));
         if (previous == null) previous = from;
-        for (double d = 0.0D; d <= checked + 0.01D; d += 1.0D) {
+        for (int i=0,steps=Math.max(1,Mth.ceil(checked));i<=steps;i++) {
+            double d=Math.min(i,checked);
             Vec3 sample = terrainProbe(from.add(dir.scale(Math.min(d, checked))), previous.y);
             Vec3 occupy = occupiableForTravel(vehicle, sample, shape, Set.of(vehicle.getUUID()), previous.y);
             if (occupy == null) return false;
             previous = occupy;
         }
-        return true;
+        return checked + 1.0E-6D < distance || sameRouteLevel(previous,to);
     }
 
     private static boolean canSweep(Entity vehicle, Vec3 from, Vec3 to, VehicleShape shape, Set<UUID> ignoredVehicles) {
         double distance = flatDistance(from, to);
-        if (distance < 1.0E-6D) return true;
+        if (distance < 1.0E-6D) return sameRouteLevel(from,to);
         Vec3 dir = to.subtract(from).multiply(1.0D, 0.0D, 1.0D).normalize();
         Vec3 previous = occupiableNear(vehicle, from, shape, ignoredVehicles);
         if (previous == null) previous = from;
-        for (double d = 1.0D; d <= distance + 0.01D; d += 1.0D) {
+        for (int i=1,steps=Math.max(1,Mth.ceil(distance));i<=steps;i++) {
+            double d=Math.min(i,distance);
             Vec3 sample = terrainProbe(from.add(dir.scale(Math.min(d, distance))), previous.y);
             Vec3 occupy = occupiableForTravel(vehicle, sample, shape, ignoredVehicles, previous.y);
             if (occupy == null) return false;
             previous = occupy;
         }
-        return true;
+        return sameRouteLevel(previous,to);
     }
 
     private static Vec3 safeTargetNear(Entity vehicle, Vec3 target, VehicleShape shape, Set<UUID> ignoredVehicles) {
@@ -3571,6 +3569,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static boolean hasActiveRoute(Entity vehicle, Vec3 target) {
         CompoundTag data = vehicle.getPersistentData();
         if (!data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)) return false;
+        if (!data.contains(FINAL_TARGET_Y)
+                || Math.abs(target.y - data.getDouble(FINAL_TARGET_Y)) > 0.75D) return false;
         double dx = target.x - data.getDouble(FINAL_TARGET_X);
         double dz = target.z - data.getDouble(FINAL_TARGET_Z);
         return dx * dx + dz * dz <= 4.0D;
@@ -3631,12 +3631,21 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static int firstUsefulIndex(List<Vec3> route, Vec3 position, VehicleShape shape) {
         double reach = Math.max(2.0D, shape.radius() * 0.55D);
-        for (int i = 1; i < route.size(); i++) if (flatDistance(position, route.get(i)) > reach) return i;
+        for (int i = 1; i < route.size(); i++) if (!routeEndpointMatches(position,route.get(i),reach)) return i;
         return Math.max(1, route.size() - 1);
     }
 
-    private static boolean hasPassedPoint(Vec3 position, Vec3 previous, Vec3 point) {
+    static boolean sameRouteLevel(Vec3 position, Vec3 point) {
+        return DominionGroundTransitionPolicy.sameLevel(position.y,point.y,.75D);
+    }
+
+    static boolean routeEndpointMatches(Vec3 position, Vec3 point, double flatTolerance) {
+        return flatDistance(position,point)<=flatTolerance && sameRouteLevel(position,point);
+    }
+
+    static boolean hasPassedPoint(Vec3 position, Vec3 previous, Vec3 point) {
         if (previous == null || point == null) return false;
+        if (!sameRouteLevel(position,point)) return false;
         Vec3 segment = point.subtract(previous).multiply(1.0D, 0.0D, 1.0D);
         Vec3 beyond = position.subtract(point).multiply(1.0D, 0.0D, 1.0D);
         return segment.lengthSqr() > 1.0E-6D && beyond.dot(segment) > 0.0D;
@@ -3644,9 +3653,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static boolean canSkipAligned(Entity vehicle, Vec3 position, Vec3 previous, Vec3 point, Vec3 next, VehicleShape shape) {
         if (point == null || next == null) return false;
+        if (!sameRouteLevel(position,point)) return false;
         double angle = turnAngle(previous == null ? position : previous, point, next);
         if (angle > 28.0D) return false;
-        return flatDistance(position, point) <= dynamicLookahead(horizontalSpeed(vehicle), shape)
+        return routeEndpointMatches(position,point,dynamicLookahead(horizontalSpeed(vehicle), shape))
                 && canTravelDirect(vehicle, position, next, shape, flatDistance(position, next) + shape.radius());
     }
 
@@ -3916,7 +3926,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static boolean shouldHardBrakeNearFinal(Entity vehicle, Vec3 finalTarget, double distance, double speed, double captureDistance) {
-        if (finalTarget == null || speed < 0.05D) return false;
+        if (finalTarget == null || speed < 0.05D || !groundGoalHeightMatchesLocal(vehicle,finalTarget)) return false;
         double effective = Math.max(ARRIVE_RADIUS + 1.0D, captureDistance + 0.50D);
         if (hasPassedFinalTarget(vehicle, finalTarget) && distance <= effective) return true;
         if (distance > ARRIVE_RADIUS + 1.25D) return false;
@@ -3936,6 +3946,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static boolean shouldCaptureFinalTarget(Entity vehicle, Vec3 finalTarget, double distance, double speed, VehicleShape shape) {
+        if (finalTarget == null || !groundGoalHeightMatchesLocal(vehicle,finalTarget)) {
+            vehicle.getPersistentData().remove(EFFECTIVE_ARRIVE_SINCE);
+            return false;
+        }
         if (distance <= ARRIVE_RADIUS) return true;
         double effective = finalCaptureDistance(shape, speed);
         CompoundTag data = vehicle.getPersistentData();
@@ -3954,22 +3968,28 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static void captureFinalTarget(Entity vehicle, Vec3 finalTarget) {
         CompoundTag data = vehicle.getPersistentData();
         data.putDouble(CAPTURED_TARGET_X, finalTarget.x);
+        data.putDouble(CAPTURED_TARGET_Y, finalTarget.y);
         data.putDouble(CAPTURED_TARGET_Z, finalTarget.z);
         data.remove(EFFECTIVE_ARRIVE_SINCE);
     }
 
     private static boolean hasCapturedFinalTarget(Entity vehicle, Vec3 finalTarget, VehicleShape shape) {
         CompoundTag data = vehicle.getPersistentData();
-        if (!data.contains(CAPTURED_TARGET_X) || !data.contains(CAPTURED_TARGET_Z)) return false;
+        if (!data.contains(CAPTURED_TARGET_X) || !data.contains(CAPTURED_TARGET_Y)
+                || !data.contains(CAPTURED_TARGET_Z)) return false;
         double dx = finalTarget.x - data.getDouble(CAPTURED_TARGET_X);
         double dz = finalTarget.z - data.getDouble(CAPTURED_TARGET_Z);
-        if (dx * dx + dz * dz > TARGET_SOFT_CHANGE_DISTANCE * TARGET_SOFT_CHANGE_DISTANCE) {
+        if (dx * dx + dz * dz > TARGET_SOFT_CHANGE_DISTANCE * TARGET_SOFT_CHANGE_DISTANCE
+                || Math.abs(finalTarget.y-data.getDouble(CAPTURED_TARGET_Y))>.75D
+                || !groundGoalHeightMatchesLocal(vehicle,finalTarget)) {
             data.remove(CAPTURED_TARGET_X);
+            data.remove(CAPTURED_TARGET_Y);
             data.remove(CAPTURED_TARGET_Z);
             return false;
         }
         if (flatDistance(vehicle.position(), finalTarget) <= finalCaptureHoldDistance(shape)) return true;
         data.remove(CAPTURED_TARGET_X);
+        data.remove(CAPTURED_TARGET_Y);
         data.remove(CAPTURED_TARGET_Z);
         return false;
     }
@@ -4778,10 +4798,13 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private record CachedTrackSafety(boolean safe, long expiresAt) {}
 
     static void clearPlanning() {
-        ASYNC_ROUTES.values().forEach(build -> { if (build.future != null) build.future.cancel(false); });
+        ASYNC_ROUTES.values().forEach(build -> build.planner.cancel());
         ASYNC_ROUTES.clear();
         TRACKED_POSE_BUILDS.clear(); TRACKED_POSE_ROUTES.clear(); TRACKED_RECOVERIES.clear();
     }
+
+    private record RouteState(int x, int z, Vec3 position) { }
+    private record RouteKey(int x, int z, int y2) { }
 
     private static final class AsyncRouteBuild {
         final Vec3 start, safe;
@@ -4789,28 +4812,99 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         final Set<UUID> ignored;
         final long generation;
         final int goalX, goalZ;
-        final List<DominionAsyncGridPlanner.Point> points = new ArrayList<>();
-        final Map<Long, DominionAsyncGridPlanner.Cell> cells = new HashMap<>();
-        int cursor;
-        int sampleLimit = 128;
+        final DominionFrontierPlanner<RouteState, RouteKey> planner;
         List<Vec3> candidate;
         int validated = 1;
-        CompletableFuture<DominionAsyncGridPlanner.Result> future;
 
-        AsyncRouteBuild(Vec3 start, Vec3 safe, VehicleShape shape, Set<UUID> ignored, long generation, int radius, int goalX, int goalZ) {
+        AsyncRouteBuild(Entity vehicle, Vec3 start, Vec3 safe, VehicleShape shape, Set<UUID> ignored,
+                        long generation, int radius, int goalX, int goalZ) {
             this.start = start; this.safe = safe; this.shape = shape; this.ignored = ignored; this.generation = generation; this.goalX = goalX; this.goalZ = goalZ;
-            points.add(new DominionAsyncGridPlanner.Point(0, 0));
-            points.add(new DominionAsyncGridPlanner.Point(goalX, goalZ));
-            for (int x = -radius; x <= radius; x++) for (int z = -radius; z <= radius; z++) {
-                if ((x == 0 && z == 0) || (x == goalX && z == goalZ)) continue;
-                points.add(new DominionAsyncGridPlanner.Point(x, z));
-            }
-            points.sort(Comparator.comparingDouble(p -> com.arxyt.dominionsword.api.DominionRouteSampling.priority(p.x(), p.z(), goalX, goalZ)));
+            // Wheel routes are coarse steering guides, not a replacement for native turn radius.
+            // The tracked pose planner remains separate and already searches incrementally.
+            double[] heights = java.util.stream.DoubleStream.of(0,.5,-.5,1,-1,1.5,-1.5,2,-2)
+                    .filter(d -> Math.abs(d)<=Math.min(2,MAX_TRAVEL_STEP_HEIGHT)+1e-6).toArray();
+            int[] dx = {1, 1, 0, -1, -1, -1, 0, 1};
+            int[] dz = {0, 1, 1, 1, 0, -1, -1, -1};
+            DominionFrontierPlanner.Domain<RouteState, RouteKey> domain = new DominionFrontierPlanner.Domain<>() {
+                public RouteKey key(RouteState state) {
+                    return new RouteKey(state.x(), state.z(), Mth.floor(state.position().y * 2.0D + 0.5D));
+                }
+                public double heuristic(RouteState state) { return flatDistance(state.position(), safe)+Math.abs(state.position().y-safe.y); }
+                public boolean isPartialBoundary(RouteState state) {
+                    return (Math.abs(goalX)>radius || Math.abs(goalZ)>radius)
+                            && (Math.abs(state.x())>=radius || Math.abs(state.z())>=radius)
+                            && heuristic(state)<heuristic(new RouteState(0,0,start));
+                }
+                public boolean isGoal(RouteState state) {
+                    return state.x() == goalX && state.z() == goalZ && Math.abs(state.position().y - safe.y) <= 0.75D;
+                }
+                public int successorCount(RouteState state) { return dx.length * heights.length; }
+                public DominionFrontierPlanner.Edge<RouteState> successor(RouteState from, int action) {
+                    int direction = action / heights.length;
+                    int x = from.x() + dx[direction], z = from.z() + dz[direction];
+                    if (x < -radius || x > radius || z < -radius || z > radius) return null;
+                    double offset = heights[action % heights.length];
+                    if (Math.abs(offset) > Math.min(2.0D, MAX_TRAVEL_STEP_HEIGHT) + 0.01D) return null;
+                    double rawY = from.position().y + offset;
+                    // Resolve only the local floor near the predecessor's height. Never fall
+                    // back to a top-level heightmap that could jump onto another deck.
+                    Vec3 next = wheelRoutePosition(vehicle, start.x + x * WHEEL_FRONTIER_STEP, rawY,
+                            start.z + z * WHEEL_FRONTIER_STEP, shape, ignored);
+                    if (next == null || !routeChunksLoaded(vehicle, from.position(), next, shape.radius() + 2.0D)
+                            || !terrainStepAllowed(from.position().y, next.y)
+                            || !canSweep(vehicle, from.position(), next, shape, ignored)
+                            || !wheelRouteSweepLocal(vehicle, from.position(), next, shape, ignored)) return null;
+                    double penalty = terrainPenalty(vehicle, next) + otherVehiclePenalty(vehicle, next, shape, ignored)
+                            + reservationPenalty(vehicle, next, shape);
+                    double cost = Math.hypot(dx[direction], dz[direction]) * WHEEL_FRONTIER_STEP
+                            + DominionGroundTransitionPolicy.heightPenalty(from.position().y,next.y) + Math.max(0.0D, penalty);
+                    return new DominionFrontierPlanner.Edge<>(new RouteState(x, z, next), cost);
+                }
+            };
+            planner = new DominionFrontierPlanner<>(domain, new RouteState(0, 0, start), 4096, 32768);
         }
     }
 
-    private record TrackedPoseKey(int x, int z, int heading) {}
-    private record TrackedPoseCacheKey(int x2, int y2, int z2, int yaw5) {}
+    private static Vec3 wheelRoutePosition(Entity vehicle, double x, double referenceY, double z,
+                                           VehicleShape shape, Set<UUID> ignored) {
+        if (!(vehicle.level() instanceof ServerLevel level)) return null;
+        BlockPos floor = BlockPos.containing(x, referenceY - 0.1D, z);
+        if (!routeChunksLoaded(vehicle, new Vec3(x, referenceY, z), new Vec3(x, referenceY, z), shape.radius() + 2.0D)) return null;
+        var support=level.getBlockState(floor).getCollisionShape(level,floor);
+        if(support.isEmpty())return null;
+        Vec3 position = new Vec3(x, floor.getY() + support.max(net.minecraft.core.Direction.Axis.Y), z);
+        return canOccupy(vehicle, position, shape, ignored) ? position : null;
+    }
+
+    private static boolean wheelRouteSweepLocal(Entity vehicle, Vec3 from, Vec3 to,
+                                                VehicleShape shape, Set<UUID> ignored) {
+        double distance = flatDistance(from, to);
+        Vec3 previous = from;
+        for (int i = 1, steps = Math.max(1, Mth.ceil(distance)); i <= steps; i++) {
+            Vec3 sample = from.lerp(to, i / (double) steps);
+            Vec3 occupy = wheelRoutePosition(vehicle, sample.x, previous.y, sample.z, shape, ignored);
+            if (occupy == null) occupy = wheelRoutePosition(vehicle, sample.x, previous.y + 1.0D, sample.z, shape, ignored);
+            if (occupy == null) occupy = wheelRoutePosition(vehicle, sample.x, previous.y - 1.0D, sample.z, shape, ignored);
+            if (occupy == null || !terrainStepAllowed(previous.y, occupy.y)) return false;
+            previous = occupy;
+        }
+        return sameRouteLevel(previous,to);
+    }
+
+    private static boolean routeChunksLoaded(Entity vehicle, Vec3 from, Vec3 to, double margin) {
+        if (!(vehicle.level() instanceof ServerLevel level)) return false;
+        int minX = Mth.floor((Math.min(from.x, to.x) - margin) / 16.0D);
+        int maxX = Mth.floor((Math.max(from.x, to.x) + margin) / 16.0D);
+        int minZ = Mth.floor((Math.min(from.z, to.z) - margin) / 16.0D);
+        int maxZ = Mth.floor((Math.max(from.z, to.z) + margin) / 16.0D);
+        for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) {
+            if (!level.hasChunk(x, z)) return false;
+        }
+        return true;
+    }
+
+    static record TrackedPoseKey(int x, int z, int y16, int heading) {}
+    static record TrackedPoseCacheKey(long xBits, long yBits, long zBits, int yawBits) {}
 
     private record TrackedPose(Vec3 position, float yaw, boolean reverse) {}
 
@@ -4862,6 +4956,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         long convexRejects;
         long terrainContacts;
         TrackedPoseNode bestNode;
+        TrackedPoseNode activeNode;
+        int nextAction;
+        boolean hitBoundary, hitNodeLimit;
         int expanded;
 
         TrackedPoseRouteBuild(Vec3 start, float startYaw, Vec3 target, TrackedHull hull, Set<UUID> ignored,
@@ -4877,22 +4974,23 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             this.startedTick = startedTick;
             this.lastProgressTick = startedTick - 20L;
             int heading = trackedPoseHeading(startYaw);
-            TrackedPoseKey startKey = new TrackedPoseKey(0, 0, heading);
+            TrackedPoseKey startKey = new TrackedPoseKey(0, 0, 0, heading);
             TrackedPoseNode startNode = new TrackedPoseNode(startKey, start, null, 0.0D,
-                    flatDistance(start, target), false);
+                    trackedGoalDistance(start,target,hull), false);
             bestNode = startNode;
             costs.put(startKey, 0.0D);
             open.add(startNode);
         }
 
         boolean matches(Vec3 otherTarget) {
-            return otherTarget != null
+            return otherTarget != null && Math.abs(target.y-otherTarget.y)<=.75
                     && flatDistanceSqr(target, otherTarget)
                     <= TRACKED_POSE_TARGET_REUSE_RADIUS * TRACKED_POSE_TARGET_REUSE_RADIUS;
         }
 
         boolean matchesFinalTarget(CompoundTag data) {
-            if (data.getLong(PATH_GENERATION) != generation || !data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)) return false;
+            if (data.getLong(PATH_GENERATION) != generation || !data.contains(FINAL_TARGET_X) || !data.contains(FINAL_TARGET_Z)
+                    || !data.contains(FINAL_TARGET_Y) || Math.abs(data.getDouble(FINAL_TARGET_Y)-target.y)>.75) return false;
             double x = data.getDouble(FINAL_TARGET_X), z = data.getDouble(FINAL_TARGET_Z);
             return (x - target.x) * (x - target.x) + (z - target.z) * (z - target.z) <= 4.0D;
         }
@@ -4900,6 +4998,10 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         boolean inRange(Vec3 position) {
             return flatDistance(anchor, position) <= range;
         }
+    }
+
+    static boolean trackedRouteMatchesTarget(Vec3 planned,Vec3 requested) {
+        return requested!=null && planned.distanceToSqr(requested)<=.01D;
     }
 
     private static final class TrackedPoseRoute {
@@ -4922,7 +5024,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         }
 
         boolean matches(Vec3 otherTarget) {
-            return otherTarget != null && flatDistanceSqr(target, otherTarget) <= 4.0D;
+            return trackedRouteMatchesTarget(target,otherTarget);
         }
 
         TrackedHull hull() {

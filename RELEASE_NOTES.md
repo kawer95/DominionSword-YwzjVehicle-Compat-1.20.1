@@ -1,3 +1,9 @@
+# 1.4.0-beta.4 — On-demand ground frontier
+
+Requires Dominion Sword 1.37.0-beta.4. Wheeled routes use an on-demand height-aware frontier. Tracked pose search retains heading, adds floor identity, verifies pivot sweeps, and budgets individual successors. Long paths retain the original goal and return checked partial segments. Route reuse, consumption and ground arrival check height; ordinary planning failure no longer enables proxy driving.
+
+Search admission is bounded; the shared time budget remains soft. No game-world physics or load benchmark has been performed.
+
 # 1.4.0-beta.3 — Remaining march route snapshots
 
 Requires Dominion Sword 1.37.0-beta.3. `marchRoute` returns the vehicle's current position and remaining, unconsumed real path nodes. Pending/failed paths remain empty; reaching the end of a partial path allows the existing incremental planner to continue. Debug straight-line previews are not used as movement routes. Native driving/physics is unchanged in this increment.

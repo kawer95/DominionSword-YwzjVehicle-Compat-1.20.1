@@ -252,6 +252,17 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         return 50;
     }
 
+    @Override public List<Vec3> marchRoute(ServerPlayer player,Entity vehicle,Vec3 target) {
+        ensureRoute(player,vehicle,target,VehicleShape.from(vehicle));
+        if(isTrackedVehicle(vehicle)) {
+            TrackedPoseRoute route=TRACKED_POSE_ROUTES.get(vehicle.getUUID());
+            return route!=null && route.matches(target) ? route.steps.stream().map(TrackedPose::position).toList() : List.of();
+        }
+        CompoundTag tag=vehicle.getPersistentData();
+        if(tag.getBoolean(PATH_ASYNC_PENDING) || tag.getBoolean(PATH_BLOCKED) || !tag.contains(PATH_POINTS,Tag.TAG_LIST))return List.of();
+        return storedRoute(vehicle,target);
+    }
+
     @Override
     public com.arxyt.dominionsword.api.DominionGroundProfile groundProfile(Entity vehicle) {
         if (!isTrackedVehicle(vehicle) && !classNameContains(vehicle, ".WheeledVehicle")) return null;
@@ -592,6 +603,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             ((AbstractVehicle) vehicle).toggleEngine(Boolean.TRUE);
             LagTrace.mark("engine");
 
+            if (com.arxyt.dominionsword.api.DominionMarchApi.shouldBrake(vehicle)) {
+                holdGroundRoute(vehicle); return true;
+            }
             VehicleShape shape = VehicleShape.from(vehicle);
             LagTrace.mark("shape");
             ensureRoute(player, vehicle, target, shape);
@@ -866,6 +880,12 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 if (!(vehicle instanceof AbstractVehicle ywzjVehicle) || !isPersistentGroundChassis(vehicle) || !vehicle.isAlive()) return true;
                 // Never synthesize input for a player-operated vehicle.
                 if (!(driver(vehicle) instanceof Mob)) return true;
+                if (com.arxyt.dominionsword.api.DominionMarchApi.shouldBrake(vehicle)) {
+                    GroundControlState brake=isTrackedVehicle(vehicle) ? trackedBrakeControl(vehicle)
+                            : new GroundControlState(false,false,false,false,true);
+                    writeControl(ywzjVehicle,brake.forward(),brake.backward(),brake.right(),brake.left(),brake.brake());
+                    return false;
+                }
                 GroundControlState control = controlEntry.getValue();
                 boolean alignedTrackedWeapons = false;
                 if (isTrackedVehicle(vehicle)) {

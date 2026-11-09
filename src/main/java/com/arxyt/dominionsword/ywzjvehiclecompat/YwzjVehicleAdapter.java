@@ -87,7 +87,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static final String HELI_COMBAT_TARGET = "DominionSwordYwzjHeliCombatTarget";
     /** Active persistent flight tasks only; never retain loaded Entity instances. */
     private static final Map<ResourceKey<Level>, Set<UUID>> ACTIVE_HELICOPTERS = new ConcurrentHashMap<>();
-    /** Last autonomous command for a ground chassis, replayed before its native physics tick. */
+    /** Stop requests retained only until native braking has removed wheel momentum. */
+    private static final Set<UUID> WHEELED_BRAKING = ConcurrentHashMap.newKeySet();
     private static final Map<ResourceKey<Level>, Map<UUID, GroundControlState>> ACTIVE_GROUND_CONTROLS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> GROUND_CONTROL_TRACE_TICKS = new ConcurrentHashMap<>();
     private static final double HELI_CLOSE_TRANSLATE_RANGE = 30.0D;
@@ -304,6 +305,25 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             return projected;
         }
         return base.inflate(0.75D, 0.25D, 0.75D);
+    }
+
+    @Override public boolean supportsCombatTarget(Entity vehicle){return supports(vehicle);}
+
+    @Override public AABB combatBounds(Entity vehicle){AABB body=mainObbAabb(vehicle);return body==null?vehicle.getBoundingBox():body;}
+
+    @Override
+    public Optional<Vec3> selectionHit(Entity entity,Vec3 from,Vec3 to) {
+        if(!(entity instanceof AbstractVehicle vehicle))return Optional.empty();
+        Vec3 nearest=null;
+        for(VehicleCubeOBB cube:vehicle.getVehicleCubeOBBs()) {
+            OBB obb=cube.obb();Vector3f[] axes=obb.getAxes();Vector3f[] vertices=obb.getVertices();
+            Vec3 center=Vec3.ZERO;for(Vector3f vertex:vertices)center=center.add(new Vec3(vertex));center=center.scale(1.0D/vertices.length);
+            Vec3 x=new Vec3(axes[0]).normalize(),y=new Vec3(axes[1]).normalize(),z=new Vec3(axes[2]).normalize();double hx=0,hy=0,hz=0;
+            for(Vector3f vertex:vertices){Vec3 d=new Vec3(vertex).subtract(center);hx=Math.max(hx,Math.abs(d.dot(x)));hy=Math.max(hy,Math.abs(d.dot(y)));hz=Math.max(hz,Math.abs(d.dot(z)));}
+            Optional<Vec3> hit=com.arxyt.dominionsword.api.DominionRayIntersections.orientedBox(from,to,center,x,y,z,new Vec3(hx,hy,hz));
+            if(hit.isPresent()&&(nearest==null||from.distanceToSqr(hit.get())<from.distanceToSqr(nearest)))nearest=hit.get();
+        }
+        return Optional.ofNullable(nearest);
     }
 
     @Override
@@ -627,7 +647,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             boolean finalTarget = flatDistance(driveTarget, safeTarget) <= 1.25D;
             double captureDistance = finalCaptureDistance(shape, speed);
             if (finalTarget && shouldHardBrakeNearFinal(vehicle, safeTarget, distance, speed, captureDistance)) {
-                if (hasPassedFinalTarget(vehicle, safeTarget) && distance <= captureDistance + 0.50D) {
+                if (hasPassedFinalTarget(vehicle, safeTarget) && distance <= ARRIVE_RADIUS) {
                     captureFinalTarget(vehicle, safeTarget);
                     pathDebug(vehicle, "FINAL_OVERSHOOT_CAPTURE", "target=%s pos=%s dist=%.2f speed=%.3f", fmt(safeTarget), fmt(vehicle.position()), distance, speed);
                 }
@@ -673,6 +693,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             short keys;
             if (driveDecision.mode() == DriveMode.REVERSE_SHORT) {
                 clearThreePointState(vehicle);
+                double stopping = ARRIVE_RADIUS + speed * speed / (2.0D * sourceBasedBrakeAcceleration(vehicle)) + speed * 2.0D;
+                if(speed>0.06D && distance<=stopping){stopVehicle(vehicle);return true;}
                 keys = shortReverseKeys(yawDiff, absYaw);
                 applyPackedControl(vehicle, keys);
                 rememberFutureFootprint(vehicle, driveTarget, shape);
@@ -693,13 +715,14 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             boolean closeBehind = driveDecision.mode() == DriveMode.TURN_AROUND;
             boolean slow = distance <= SLOW_RADIUS || absYaw >= TURN_IN_PLACE_ANGLE;
             double routeLimit = routeCurvatureSpeedLimit(vehicle, driveTarget, speed);
-            boolean brake = (finalTarget && shouldBrake(vehicle, distance, speed, absYaw)) || speed > routeLimit || shouldYield(vehicle, driveTarget, shape);
+            if(finalTarget)routeLimit=Math.min(routeLimit,Math.sqrt(Math.max(0.0D,distance-ARRIVE_RADIUS)*sourceBasedBrakeAcceleration(vehicle)));
+            boolean brake = (finalTarget && shouldBrake(vehicle, distance, speed, absYaw)) || shouldYield(vehicle, driveTarget, shape);
             // A route point is a forward steering instruction. Target yaw alone says nothing
             // about whether the car is physically boxed in.
-            boolean forward = !brake && !closeBehind;
+            boolean forward = !brake && !closeBehind && speed < routeLimit;
             boolean backward = !brake && closeBehind;
             boolean turn = absYaw > (slow ? 4.0D : 8.0D);
-            if (finalTarget && !brake && distance <= Math.max(ARRIVE_RADIUS + 1.25D, captureDistance)) {
+            if (finalTarget && !brake && speed > 0.06D && distance <= Math.max(ARRIVE_RADIUS + 1.25D, captureDistance)) {
                 brake = true;
                 forward = false;
                 backward = false;
@@ -845,8 +868,16 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
                 Entity vehicle = level.getEntity(controlEntry.getKey());
                 if (!(vehicle instanceof AbstractVehicle ywzjVehicle) || !isPersistentGroundChassis(vehicle) || !vehicle.isAlive()) return true;
                 // Never synthesize input for a player-operated vehicle.
-                if (!(driver(vehicle) instanceof Mob)) return true;
+                if (!(driver(vehicle) instanceof Mob)) { WHEELED_BRAKING.remove(vehicle.getUUID()); return true; }
                 GroundControlState control = controlEntry.getValue();
+                if (WHEELED_BRAKING.contains(vehicle.getUUID())) {
+                    if (horizontalSpeed(vehicle) <= 0.008D) {
+                        WHEELED_BRAKING.remove(vehicle.getUUID());
+                        ywzjVehicle.controlUnit.reset();
+                        return true;
+                    }
+                    control = trackedBrakeControl(vehicle);
+                }
                 boolean alignedTrackedWeapons = false;
                 if (isTrackedVehicle(vehicle)) {
                     // A Dominion move callback is intentionally sparse.  Re-evaluate the
@@ -1260,6 +1291,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static void unregisterActiveGroundControl(Entity vehicle) {
+        if (vehicle != null) WHEELED_BRAKING.remove(vehicle.getUUID());
         if (vehicle == null) return;
         Map<UUID, GroundControlState> entries = ACTIVE_GROUND_CONTROLS.get(vehicle.level().dimension());
         if (entries != null) {
@@ -3207,8 +3239,8 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static Vec3 safeTargetNear(Entity vehicle, Vec3 target, VehicleShape shape, Set<UUID> ignoredVehicles) {
         Vec3 direct = occupiableNear(vehicle, target, shape, ignoredVehicles);
         Vec3 origin = vehicle.position();
-        if (direct != null && canTravelDirect(vehicle, origin, direct, shape,
-                Math.max(PATH_LOOKAHEAD_MIN, flatDistance(origin, direct) + shape.radius()))) return direct;
+        // An obstacle on the way requires routing, not silently moving a valid destination.
+        if (direct != null) return direct;
         List<SafeCandidate> candidates = new ArrayList<>();
         for (double radius = PATH_STEP; radius <= Math.max(18.0D, shape.radius() * 3.0D); radius += PATH_STEP) {
             for (int angle = 0; angle < 360; angle += 20) {
@@ -3262,9 +3294,20 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (base.getY() != Mth.floor(baseY)) base = BlockPos.containing(around.x, baseY, around.z);
         for (int dy = 2; dy >= -4; dy--) {
             BlockPos floor = base.offset(0, dy - 1, 0);
-            if (level.getBlockState(floor).getCollisionShape(level, floor).isEmpty()) continue;
-            Vec3 candidate = new Vec3(around.x, floor.getY() + 1.0D, around.z);
-            if (canOccupy(vehicle, candidate, shape, ignoredVehicles)) return candidate;
+            VoxelShape support = level.getBlockState(floor).getCollisionShape(level, floor);
+            if (support.isEmpty()) continue;
+            if (isTrackedVehicle(vehicle)) {
+                Vec3 candidate = new Vec3(around.x, floor.getY() + 1.0D, around.z);
+                if (canOccupy(vehicle, candidate, shape, ignoredVehicles)) return candidate;
+                continue;
+            }
+            // A stair's lower tread and a bottom slab are not a full block high.
+            // Probe each real collision surface, keeping the existing hull/support test.
+            for (AABB surface : support.toAabbs()) {
+                double bottomOffset = shape.nativeBox().minY - shape.nativeBoxOrigin().y;
+                Vec3 candidate = new Vec3(around.x, floor.getY() + surface.maxY - bottomOffset, around.z);
+                if (canOccupy(vehicle, candidate, shape, ignoredVehicles)) return candidate;
+            }
         }
         return null;
     }
@@ -3310,10 +3353,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static boolean canOccupyVoxelVehicleSpace(Entity vehicle, Vec3 position, VehicleShape shape) {
         if (!(vehicle.level() instanceof ServerLevel level)) return true;
-        // WheeledVehicle uses a rigid native collision chassis.  It was working with
-        // this strict volume check before 1.2.49; applying the tracked-vehicle
-        // suspension profile to it made the planner approve positions its chassis
-        // could not actually drive through.  Keep its proven pre-1.2.49 behavior.
+        // Wheels retain a full collision hull and actual ground support. The local
+        // step allowance models the front entering a tread before the centre rises;
+        // do not substitute the tracked suspension's terrain-only footprint rule.
         if (!isTrackedVehicle(vehicle)) return canOccupyStrictVehicleSpace(level, vehicle, position, shape);
 
         int height = Math.max(2, shape.voxelHeight());
@@ -3352,14 +3394,20 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         // The old test inflated a wheeled car into a square based on every decorative OBB.
         // Query the actual Entity collision box instead: it is the footprint native driving
         // can genuinely pass through.
-        AABB body = shape.aabbAt(position);
-        if (!level.noCollision(vehicle, body)) return false;
-        double insetX = Math.min(0.12D, Math.max(0.0D, body.getXsize() * 0.20D));
-        double insetZ = Math.min(0.12D, Math.max(0.0D, body.getZsize() * 0.20D));
-        AABB supportProbe = new AABB(
-                body.minX + insetX, body.minY - 0.18D, body.minZ + insetZ,
-                body.maxX - insetX, body.minY - 0.02D, body.maxZ - insetZ);
-        return !level.noCollision(vehicle, supportProbe);
+        AABB base = shape.aabbAt(position);
+        // A level AABB meets the next tread before the native suspension has pitched up.
+        // Permit at most one native terrain step, with collision-free hull and real support.
+        // This never permits a wall-sized rise: edge traversal still checks centre heights.
+        for (double lift : new double[]{0.0D, 0.5D, 1.0D}) {
+            AABB body = base.move(0.0D, lift, 0.0D);
+            if (!level.noCollision(vehicle, body.deflate(1.0E-6D))) continue;
+            double insetX = Math.min(0.12D, body.getXsize() * 0.20D);
+            double insetZ = Math.min(0.12D, body.getZsize() * 0.20D);
+            AABB supportProbe = new AABB(body.minX + insetX, body.minY - 0.18D, body.minZ + insetZ,
+                    body.maxX - insetX, body.minY - 0.02D, body.maxZ - insetZ);
+            if (!level.noCollision(vehicle, supportProbe)) return true;
+        }
+        return false;
     }
 
     /** Adjacent terrain samples may differ by one natural step, but never by a wall-sized ledge. */
@@ -3791,6 +3839,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static boolean shouldBrake(Entity vehicle, double distance, double speed, double absYaw) {
+        if (speed <= 0.06D) return distance <= ARRIVE_RADIUS;
         double turnPenalty = absYaw >= TURN_IN_PLACE_ANGLE ? 0.75D : 0.0D;
         double deceleration = sourceBasedBrakeAcceleration(vehicle);
         double idealStop = speed * speed / Math.max(0.01D, 2.0D * deceleration);
@@ -3803,13 +3852,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (isTrackedVehicle(vehicle)) {
             return Math.max(0.01D, readDouble(readMember(vehicle, "brakeAcceleration"), 0.025D));
         }
-        return Math.max(0.01D, readDouble(readMember(vehicle, "brakeForce"), 0.025D));
+        Object physics = readMember(vehicle, "physicsEngine");
+        Object info = readMember(physics, "physicsInfo");
+        double mass = readDouble(readMember(info, "mass"), 1.0D);
+        double force = readDouble(readMember(vehicle, "brakeForce"), 0.025D);
+        // Native WheeledVehicle divides propulsion/braking force by its live mass,
+        // including fuel. Force alone substantially underestimates stopping distance.
+        return Math.max(1.0E-4D, force / Math.max(0.01D, mass));
     }
 
     private static boolean shouldHardBrakeNearFinal(Entity vehicle, Vec3 finalTarget, double distance, double speed, double captureDistance) {
         if (finalTarget == null || speed < 0.05D) return false;
         double effective = Math.max(ARRIVE_RADIUS + 1.0D, captureDistance + 0.50D);
-        if (hasPassedFinalTarget(vehicle, finalTarget) && distance <= effective) return true;
+        if (hasPassedFinalTarget(vehicle, finalTarget) && distance <= ARRIVE_RADIUS) return true;
         if (distance > ARRIVE_RADIUS + 1.25D) return false;
         Vec3 toTarget = finalTarget.subtract(vehicle.position()).multiply(1.0D, 0.0D, 1.0D);
         Vec3 velocity = vehicle.getDeltaMovement().multiply(1.0D, 0.0D, 1.0D);
@@ -3827,19 +3882,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static boolean shouldCaptureFinalTarget(Entity vehicle, Vec3 finalTarget, double distance, double speed, VehicleShape shape) {
-        if (distance <= ARRIVE_RADIUS) return true;
-        double effective = finalCaptureDistance(shape, speed);
-        CompoundTag data = vehicle.getPersistentData();
-        if (distance <= effective) {
-            long now = vehicle.level().getGameTime();
-            if (!data.contains(EFFECTIVE_ARRIVE_SINCE)) {
-                data.putLong(EFFECTIVE_ARRIVE_SINCE, now);
-                return false;
-            }
-            return now - data.getLong(EFFECTIVE_ARRIVE_SINCE) >= EFFECTIVE_ARRIVAL_TIMEOUT_TICKS;
-        }
-        data.remove(EFFECTIVE_ARRIVE_SINCE);
-        return false;
+        return distance <= ARRIVE_RADIUS;
     }
 
     private static void captureFinalTarget(Entity vehicle, Vec3 finalTarget) {
@@ -3859,7 +3902,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
             data.remove(CAPTURED_TARGET_Z);
             return false;
         }
-        if (flatDistance(vehicle.position(), finalTarget) <= finalCaptureHoldDistance(shape)) return true;
+        if (flatDistance(vehicle.position(), finalTarget) <= ARRIVE_RADIUS + 0.5D) return true;
         data.remove(CAPTURED_TARGET_X);
         data.remove(CAPTURED_TARGET_Z);
         return false;
@@ -3891,7 +3934,7 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         double turnRadius = estimatedTurnRadius(vehicle, shape);
         boolean rearTarget = absYaw >= REVERSE_ANGLE;
         boolean tracked = isTrackedVehicle(vehicle);
-        boolean shortReverseTarget = isShortReverseTarget(absYaw, distance, shape);
+        boolean shortReverseTarget = shortReverseFits(absYaw,distance,turnRadius);
         boolean threePointCooldown = vehicle.level().getGameTime() < vehicle.getPersistentData().getLong(THREE_POINT_GIVE_UP_UNTIL);
         boolean cannotArc = shouldUseThreePointTurn(!tracked, shortReverseTarget, threePointCooldown,
                 finalTarget, cannotArcToTarget(vehicle, absYaw, distance, shape));
@@ -3901,16 +3944,19 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         if (cannotArc) forwardEta += 80.0D;
         double reverseEta = distance / 0.06D + Math.abs(Mth.wrapDegrees(yawDiff - 180.0F)) / 8.0D + stopPenalty * 1.15D;
         double turnAroundEta = stopPenalty + 50.0D + distance / 0.10D;
-        // Do not infer a reverse manoeuvre from a waypoint's relative angle. A waypoint is
-        // normally ahead on the drivable corridor even if it is not yet inside the current
-        // turning circle. Native collision/stuck recovery is the only valid reason to back up.
+        // Intermediate waypoints remain forward steering hints. A nearby final goal can
+        // instead require a bounded reverse approach or a multi-point turn.
+        if (!tracked && finalTarget && shortReverseTarget)
+            return new DriveDecision(DriveMode.REVERSE_SHORT, forwardEta, reverseEta, turnAroundEta);
+        if (cannotArc || (!tracked && finalTarget && vehicle.getPersistentData().contains(THREE_POINT_STEP) && absYaw>30.0D))
+            return new DriveDecision(DriveMode.THREE_POINT, forwardEta, reverseEta, turnAroundEta);
         return new DriveDecision(DriveMode.FORWARD, forwardEta, reverseEta, turnAroundEta);
     }
 
     /** A route waypoint is a steering hint; reserve a K-turn for a real final target. */
     static boolean shouldUseThreePointTurn(boolean wheeled, boolean shortReverseTarget, boolean threePointCooldown,
                                            boolean finalTarget, boolean cannotArcToTarget) {
-        return false;
+        return wheeled && finalTarget && !shortReverseTarget && !threePointCooldown && cannotArcToTarget;
     }
 
     /**
@@ -3980,9 +4026,21 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     }
 
     private static double estimatedTurnRadius(Entity vehicle, VehicleShape shape) {
-        double maxTurn = Math.abs(readDouble(readMember(vehicle, "maxTurn"), 2.0D));
-        double turnRadians = Math.toRadians(Math.max(1.0D, maxTurn));
-        return Math.max(shape.radius() * 2.0D, shape.radius() / Math.max(0.05D, turnRadians));
+        Object cube=invokeNoArg(vehicle,"getMainCubeOBB");
+        double length=readDouble(readMember(cube,"depth"),Math.max(shape.nativeBox().getXsize(),shape.nativeBox().getZsize()));
+        double maximum=readDouble(readMember(vehicle,"maxSpeedForward"),0.5D);
+        // Native full steering divides turnAngle by maxTurn; maxTurn is not a wheel angle in radians.
+        double factor=1.0D-Math.min(1.0D,horizontalSpeed(vehicle)/Math.max(.05D,maximum))*.5D;
+        return Math.max(shape.radius()*2.0D,length/factor);
+    }
+
+    static boolean shortReverseFits(double angle,double distance,double radius) {
+        // A goal inside the minimum reverse-turn circle needs a K-turn unless
+        // that circle can still enter the existing one-block arrival tolerance.
+        double toCircleCenterSqr=radius*radius+distance*distance
+                -2.0D*radius*distance*Math.sin(Math.toRadians(180.0D-angle));
+        double inner=Math.max(0.0D,radius-1.0D);
+        return angle>=120.0D && distance<=25.0D && toCircleCenterSqr>=inner*inner;
     }
 
     private static boolean isShortReverseTarget(double absYaw, double distance, VehicleShape shape) {
@@ -4025,8 +4083,9 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
         boolean left = false;
         if (absYaw < 170.0D) {
             // Backing up reverses steering response, so steer opposite the forward yaw error.
-            right = yawDiff < 0.0F;
-            left = yawDiff > 0.0F;
+            float rearError = Mth.wrapDegrees(yawDiff - 180.0F);
+            right = rearError < -4.0F;
+            left = rearError > 4.0F;
         }
         return packControl(false, true, right, left, false);
     }
@@ -4120,12 +4179,30 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
 
     private static void applyControl(Entity vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
         if (!(vehicle instanceof AbstractVehicle ywzjVehicle)) return;
+        WHEELED_BRAKING.remove(vehicle.getUUID());
         writeControl(ywzjVehicle, forward, backward, right, left, brake);
         registerActiveGroundControl(vehicle, forward, backward, right, left, brake);
         alignMainWeaponsForward(vehicle, forward);
     }
 
     private static void writeControl(AbstractVehicle vehicle, boolean forward, boolean backward, boolean right, boolean left, boolean brake) {
+        if (vehicle instanceof WheeledVehicle && driver(vehicle) instanceof Mob) {
+            boolean stopping = brake || WHEELED_BRAKING.contains(vehicle.getUUID());
+            Vec3 goal = activeSafeTarget(vehicle, null);
+            double distance = goal == null ? 8.0D : flatDistance(vehicle.position(), goal);
+            double angle = goal == null ? 0.0D : Math.abs(Mth.wrapDegrees(yawTo(goal.subtract(vehicle.position())) - vehicle.getYRot()));
+            double limit = stopping ? 0.0D : wheelSpeedLimit(distance, angle, backward,
+                    vehicle.getPersistentData().contains(THREE_POINT_STEP));
+            double signedSpeed = vehicle.getDeltaMovement().dot(Vec3.directionFromRotation(0.0F, vehicle.getYRot()));
+            int requested = stopping ? 0 : forward ? 1 : backward ? -1 : 0;
+            int pedal = wheelPedal(requested, signedSpeed, limit, vehicle.level().getGameTime());
+            if (stopping || requested * signedSpeed < -0.02D) { right = false; left = false; }
+            forward = pedal > 0;
+            backward = pedal < 0;
+            // Wheel control.up is the handbrake: counter-throttle must never press it.
+            brake = false;
+            vehicle.getPersistentData().putDouble("DominionWheelDesiredSpeed", limit);
+        }
         ControlUnit control = vehicle.controlUnit;
         control.forward = forward;
         control.backward = backward;
@@ -4194,10 +4271,36 @@ public final class YwzjVehicleAdapter implements DominionVehicleAdapter {
     private static void stopVehicle(Entity vehicle) {
         unregisterActiveGroundControl(vehicle);
         clearTrackedEscapePivot(vehicle.getPersistentData());
-        if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
+        if (vehicle instanceof WheeledVehicle chassis && driver(vehicle) instanceof Mob && horizontalSpeed(vehicle) > 0.008D) {
+            // Native opposite throttle brakes; merely releasing every key lets the car coast.
+            GroundControlState braking = trackedBrakeControl(vehicle);
+            writeControl(chassis, braking.forward(), braking.backward(), false, false, true);
+            registerActiveGroundControl(vehicle, braking.forward(), braking.backward(), false, false, true);
+            WHEELED_BRAKING.add(vehicle.getUUID());
+        } else if (vehicle instanceof AbstractVehicle ywzjVehicle) ywzjVehicle.controlUnit.reset();
     }
 
     private record GroundControlState(boolean forward, boolean backward, boolean right, boolean left, boolean brake) {}
+
+    /** Blocks/tick, bounded for the final goal even while a K-turn temporarily moves away. */
+    static double wheelSpeedLimit(double distance, double absYaw, boolean reverse, boolean maneuver) {
+        double limit = distance <= 4.0D ? 0.065D : distance <= 10.0D ? 0.10D : distance <= 20.0D ? 0.16D : 0.50D;
+        if (absYaw >= 90.0D) limit = Math.min(limit, 0.10D);
+        else if (absYaw >= 45.0D) limit = Math.min(limit, 0.12D);
+        else if (absYaw >= 20.0D) limit = Math.min(limit, 0.20D);
+        if (reverse || maneuver) limit = Math.min(limit, 0.10D);
+        return limit;
+    }
+
+    /** Native longitudinal pedals only: 1=W, -1=S, 0=coast. Close moves pulse 2/4 ticks. */
+    static int wheelPedal(int requested, double signedSpeed, double limit, long tick) {
+        double speed = Math.abs(signedSpeed);
+        if (limit <= 0.0D) return speed > 0.008D ? (signedSpeed > 0 ? -1 : 1) : 0;
+        if (requested * signedSpeed < -0.015D) return requested;
+        if (speed > limit + 0.008D) return signedSpeed > 0 ? -1 : 1;
+        if (speed >= limit - 0.008D || requested == 0) return 0;
+        return limit <= 0.22D && (tick & 3L) >= 2L ? 0 : requested;
+    }
 
     private static void pathDebug(Entity vehicle, String phase, String format, Object... args) {
         if (verbosePathPhase(phase) && !YwzjVehicleCompatConfig.pathTraceVerbose()) return;

@@ -20,3 +20,15 @@ local.properties
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Private, generated terrain test clients and delivery notes
+/run-render-terrain-*/
+/run-render-vehicle-*/
+/run-render-wheel-*/
+/run-render-rear-target-*/
+/verification/terrain-client/__pycache__/
+/.engineering/
+/release/autodrive-20261108/
+/release/vehicle-compat-20261109/
+/release/wheel-pedals-20261109/
+/release/wheel-rear-20261109/
